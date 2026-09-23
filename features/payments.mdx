@@ -204,7 +204,8 @@ The `Pago` model stores gateway-specific identifiers for both Pagopar and DLocal
 ```php
 // app/Models/Pago.php
 protected $fillable = [
-    'contrato_id', 'monto', 'estado', 'pasarela',
+    'contrato_id', 'monto', 'estado',
+    'transaccion_pasarela', 'fecha_pago', 'pasarela',
     // Pagopar columns
     'pagopar_hash', 'pagopar_numero_pedido',
     'pagopar_forma_pago', 'pagopar_forma_pago_id', 'pagopar_comprobante',

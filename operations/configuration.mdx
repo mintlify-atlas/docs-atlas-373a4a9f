@@ -1,5 +1,5 @@
 ---
-title: "Configuration Reference: Environment Variables"
+title: "ExcedentMarket: Complete Environment Variable Reference"
 sidebarTitle: "Configuration"
 description: "Complete reference for all environment variables in ExcedentMarket's root .env and web/.env, grouped by category with types and production guidance."
 ---
@@ -30,6 +30,18 @@ These variables are read by Docker Compose to determine how to build and start t
   Prefix for container names and Docker image tags. The Compose project name is hardcoded to `marketplace-b2b` (in `compose.yml`) to protect volume names from changing if the directory is renamed. This variable only affects image and container naming.
 
   **Default:** `excedentmarket-2025`
+</ParamField>
+
+<ParamField body="SERVER_NAME" type="string">
+  The `ServerName` directive passed to Apache inside the container. Used for virtual-host matching and to suppress the "Could not reliably determine the server's fully qualified domain name" warning on startup.
+
+  **Default:** `excedentmarket.local`
+</ParamField>
+
+<ParamField body="SERVER_ADMIN" type="string">
+  The `ServerAdmin` directive for Apache error pages. In production, set this to the actual operations contact address.
+
+  **Default:** `soporte@excedentmarket.com`
 </ParamField>
 
 <ParamField body="MANTENER_DATOS" type="boolean">
@@ -182,12 +194,6 @@ These variables live in `web/.env` and configure the Laravel application core.
   **Default:** `1025`
 </ParamField>
 
-<ParamField body="MAIL_UI_PORT" type="integer">
-  Host port for Mailpit's web interface, where all captured outgoing emails are viewable. The default `8025` is common and may already be in use; override it here.
-
-  **Default:** `8025`
-</ParamField>
-
 ---
 
 ## Services
@@ -259,4 +265,5 @@ ExcedentMarket performs local OCR on uploaded environmental license PDFs using T
 | `WEB_PORT` | `2019` | Host port for the Apache container. Access the app at `http://localhost:${WEB_PORT}`. |
 | `VITE_PORT` | `5173` | Vite HMR dev server port. Read by both `compose.yml` (port binding) and `vite.config.ts` (server config) from the same variable, eliminating dual sources of truth. Dev target only. |
 | `VITE_HMR_HOST` | `localhost` | The hostname the browser's HMR WebSocket client connects to. Change to the machine's LAN IP when working from another device on the same network. |
+| `MAIL_UI_PORT` | `8025` | Host port for Mailpit's web UI, where all captured outgoing emails are viewable. The default `8025` is a common port; override it here if it conflicts. Root `.env` only — this controls a Compose port binding, not an application setting. |
 | `ADMINER_PORT` | `2020` | Host port for Adminer's web UI. Only active with `--profile tools`. |

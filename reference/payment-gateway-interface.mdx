@@ -280,17 +280,17 @@ The implementation is responsible for:
   </Step>
 
   <Step title="Register in AppServiceProvider">
-    The `PaymentGatewayManager` is bound as a singleton. Add your gateway to the registration call:
+    The `PaymentGatewayManager` is bound as a singleton. Each gateway is instantiated directly, receiving its underlying service from the container. Add your gateway to the registration call:
 
     ```php
     // app/Providers/AppServiceProvider.php
 
     $this->app->singleton(PaymentGatewayManager::class, function ($app) {
         return new PaymentGatewayManager([
-            $app->make(PagoparGateway::class),
-            $app->make(DLocalGoGateway::class),
-            $app->make(SimuladoGateway::class),
-            $app->make(MiGatewayGateway::class), // ← add here
+            new PagoparGateway($app->make(PagoparService::class)),
+            new DLocalGoGateway($app->make(DLocalGoService::class)),
+            new SimuladoGateway($app->make(PagoparService::class)),
+            new MiGatewayGateway($app->make(MiGatewayService::class)), // ← add here
         ]);
     });
     ```

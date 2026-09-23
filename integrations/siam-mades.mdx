@@ -189,18 +189,20 @@ SIAM endpoints are configured in `config/services.php` and read from environment
 
 ```php
 'siam' => [
-    'rest'        => env('SIAM_REST_URL'),
-    'declaracion' => env('SIAM_DECLARACION_URL'),
-    'portal'      => env('SIAM_PORTAL_URL'),
-    'estado'      => env('SIAM_ESTADO', 20),
-    'timeout'     => env('SIAM_TIMEOUT', 30),
+    'rest'        => env('SIAM_REST_URL', 'https://apps.mades.gov.py/siam/portal/dashboard-proyecto/rest'),
+    'declaracion' => env('SIAM_DECLARACION_URL', 'https://apps.mades.gov.py/siam/portal/dashboard-proyecto/declaracion'),
+    'portal'      => env('SIAM_PORTAL_URL', 'https://apps.mades.gov.py/siam/portal/proyecto-informes'),
+    'estado'      => (int) env('SIAM_ESTADO', 20),
+    'actividad'   => env('SIAM_ACTIVIDAD', '54,407,56,55,57'),
+    'timeout'     => (int) env('SIAM_TIMEOUT', 30),
 ],
 ```
 
-| Variable | Purpose |
-|---|---|
-| `SIAM_REST_URL` | Base URL for the DataTables REST endpoint (`?sSearch=…`) |
-| `SIAM_DECLARACION_URL` | Base URL for the declaration download endpoint (`/{expId}`) |
-| `SIAM_PORTAL_URL` | Public portal URL shown in audit links for administrators |
-| `SIAM_ESTADO` | Filter code for approved resolutions (default `20`) |
-| `SIAM_TIMEOUT` | HTTP timeout per request in seconds (default `30`) |
+| Variable | Default | Purpose |
+|---|---|---|
+| `SIAM_REST_URL` | MADES DataTables endpoint | Base URL for the REST endpoint that accepts `?sSearch=…` queries and returns `aaData` rows. |
+| `SIAM_DECLARACION_URL` | MADES declaration endpoint | Base URL for the PDF download endpoint. The integer expedition ID is appended as a path segment (`/{expId}`). |
+| `SIAM_PORTAL_URL` | MADES public portal | Human-readable portal URL surfaced in admin audit links so administrators can verify results directly at the source. |
+| `SIAM_ESTADO` | `20` | Filter code passed to the REST endpoint; `20` selects expedientes with an approved declaration or resolution. |
+| `SIAM_ACTIVIDAD` | `54,407,56,55,57` | Comma-separated MADES activity codes covering waste management layers (urban and hazardous). Defined in config for future use; not yet passed as a query parameter by `LicenciaSiamService`. |
+| `SIAM_TIMEOUT` | `30` | HTTP timeout per request in seconds. |

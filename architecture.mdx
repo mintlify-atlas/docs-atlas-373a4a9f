@@ -9,7 +9,7 @@ ExcedentMarket is built as a single cohesive Laravel 13 application that serves 
 ## Technology Stack
 
 <CardGroup cols={2}>
-  <Card title="Laravel 13 / PHP 8.3" icon="php">
+  <Card title="Laravel 13 / PHP 8.4" icon="php">
     Application framework. Strict types enforced throughout. Models use explicit `$fillable` arrays — never `$guarded = []`. Generated with Artisan first; hand-written code only when no generator exists.
   </Card>
   <Card title="Filament 5" icon="table-columns">
@@ -35,7 +35,7 @@ The platform runs as five cooperating services defined in `compose.yml`. All ser
 
 | Service | Image / Role | Published Ports | Key Volumes |
 |---|---|---|---|
-| `web` | PHP 8.3 + Apache 2 + Vite HMR (dev) | `2019:80`, `5173:5173` | `cv_storage`, `private_storage`, `app_state`, `node_modules` |
+| `web` | PHP 8.4 + Apache 2 + Vite HMR (dev) | `2019:80`, `5173:5173` | `cv_storage`, `private_storage`, `app_state`, `node_modules` |
 | `queue` | Laravel queue worker (`queue:work`) | — | `app_state`, `cv_storage`, `private_storage` |
 | `scheduler` | Laravel task scheduler (`schedule:work`) | — | `app_state`, `cv_storage`, `private_storage` |
 | `database` | `postgres:16-alpine` | `5432:5432` | `pgdata` |
@@ -74,7 +74,7 @@ Each volume has a specific purpose and scope. Sharing `app_state` across `web`, 
 
 ## Filament Panels
 
-Three Filament 5 panels are registered in `bootstrap/app.php`, each with its own route prefix, guard, and permission set managed by Filament Shield (`bezhansalleh/filament-shield ^4.0`).
+Three Filament 5 panels are registered in `bootstrap/providers.php` via their `PanelProvider` classes (`app/Providers/Filament/`), each with its own route prefix, guard, and permission set managed by Filament Shield (`bezhansalleh/filament-shield ^4.0`).
 
 <Tabs>
   <Tab title="/admin">
@@ -196,11 +196,13 @@ The Dockerfile uses multi-stage builds with two named output targets, sharing a 
 
 | Stage | Purpose |
 |---|---|
-| `base` | PHP 8.3 + Apache, system packages (`gosu`, `postgresql-client`, `tesseract-ocr`, `poppler-utils`), all PHP extensions, Apache virtual host config |
-| `vendor-prod` | Composer production dependencies (`--no-dev`) |
-| `vendor-dev` | Composer all dependencies (including dev) |
+| `node-runtime` | Thin alias over `node:22-bookworm-slim`. Used only as a copy source for Node binaries — never a final target. |
+| `base` | PHP 8.4 + Apache, system packages (`gosu`, `postgresql-client`, `tesseract-ocr`, `poppler-utils`), all PHP extensions, Apache virtual host config |
+| `vendor-base` | Inherits `base`; adds Composer and copies `composer.json` + `composer.lock`. Shared parent for the two Composer install stages below. |
+| `vendor-prod` | Composer production dependencies (`--no-dev`), built on top of `vendor-base` |
+| `vendor-dev` | Composer all dependencies (including dev), built on top of `vendor-base` |
 | `assets` | Node 22 — runs `npm ci` + `vite build`, outputs `public/build/` |
-| `dev` | Final dev image: copies Node binaries, `vendor-dev`, and `public/build/` (as a fallback if Vite HMR hasn't started). `opcache.validate_timestamps = 1` |
+| `dev` | Final dev image: copies Node binaries from `node-runtime`, `vendor-dev`, and `public/build/` (as a fallback if Vite HMR hasn't started). `opcache.validate_timestamps = 1` |
 | `prod` | Final prod image: no Node, `vendor-prod`, `public/build/`. `opcache.validate_timestamps = 0`, classmap-authoritative autoloader |
 
 <Tip>

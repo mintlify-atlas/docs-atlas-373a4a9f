@@ -1,7 +1,7 @@
 ---
-title: "Filament 5 Panel Architecture and Conventions"
+title: "Filament 5 Panel Architecture — ExcedentMarket Panels"
 sidebarTitle: "Filament Panels"
-description: "How ExcedentMarket's three Filament 5 panels are structured, the critical page placement rules, permission generation order, and Filament 5 namespace changes."
+description: "ExcedentMarket's three Filament 5 panels explained: structure, page placement rules, permission generation order, and key Filament 5 namespace changes."
 ---
 
 ExcedentMarket uses Filament 5 with three distinct panels, each serving a different actor in the circular economy marketplace. Understanding how panels, resources, and pages relate to each other — and the specific ordering requirements — prevents the most common setup errors.
@@ -212,7 +212,7 @@ public function panel(Panel $panel): Panel
         ->id('admin')
         ->path('admin')
         ->login()
-        ->colors(['primary' => Color::Amber])
+        ->colors(['primary' => Color::Teal])
         ->discoverResources(
             in: app_path('Filament/Admin/Resources'),
             for: 'App\\Filament\\Admin\\Resources',

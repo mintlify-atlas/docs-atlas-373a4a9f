@@ -40,7 +40,10 @@ This is deliberately broader than `ESTADOS_VISIBLES` (`['publicado', 'en_negocia
 | `en_negociacion` | ✅ | ✅ | Offers are open; material is still committed |
 | `adjudicado` | ❌ | ✅ | Lot sold; physically still in the warehouse until contract completes |
 | `cerrado` | ❌ | ❌ | Lot withdrawn; material is free again |
-| `completado` | ❌ | ❌ | Contract done; egress already recorded |
+
+<Note>
+  `completado` is a **contract** state (`EstadoContrato`), not a lot state. Lots have no `completado` state — once a contract completes, the lot remains in `adjudicado`. The inventory egress is recorded when the contract enters `activo` (payment confirmed), via the `ContratoObserver`.
+</Note>
 
 <Warning>
   An `adjudicado` lot has **left the catalog** — no new offers can be submitted — but its material is still physically in the generator's warehouse. `LotePublicado::cantidadComprometida()` includes adjudicado lots when computing reserved quantities, preventing double-publication of the same physical stock.

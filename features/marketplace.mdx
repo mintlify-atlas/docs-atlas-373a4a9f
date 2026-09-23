@@ -154,9 +154,9 @@ The factor (`factor_kgCO2_por_kg`) comes from the `FactorEmision` records linked
 
 ## Hazardous Waste Exclusion
 
-Lots whose material is classified as **Class A** (peligroso / hazardous) under Ley N.° 3956/2009 are excluded from the catalog. The `scopeVisibles()` scope inherits this exclusion through `Material::scopeComercializable()`, which filters out `clase_residuo = 'A'`.
+Lots whose material is classified as **Class A** (peligroso / hazardous) under Ley N.° 3956/2009 cannot be published. The exclusion is enforced at **publication time** via `LotePublicado::esPublicable()` → `motivoNoPublicable()`, which checks both the lot's own `clase_residuo` and the material's `clase_residuo`. A lot that passes this gate is already free of Class A waste by the time it reaches the catalog, so `scopeVisibles()` does not need to repeat the check — it only filters by `estado` and `archivado_at`.
 
-A lot can also declare its own waste class, and the check runs on both the lot and its material:
+A lot can also declare its own waste class in addition to inheriting it from its material. The check runs on both:
 
 ```php
 // app/Models/LotePublicado.php
@@ -174,7 +174,7 @@ public function motivoNoPublicable(): ?string
 ```
 
 <Warning>
-  Lots carrying Class A hazardous waste cannot be published. Attempting to publish them via `OfertaService` or the Filament panel will return an explanatory message via `motivoNoPublicable()`.
+  Lots carrying Class A hazardous waste cannot be published. The Filament panel and the public offer form both call `motivoNoPublicable()` and surface the rejection reason before writing anything to the database. A lot already in the catalog is guaranteed to have passed this gate at publication time.
 </Warning>
 
 ## Pagination

@@ -193,11 +193,16 @@ After the run completes, if any companies came back with `valido_cancelado` or `
 
 ## Scheduled Imports
 
-The padron import is meant to run once a month after the DNIT publishes a new file. Wire it in `routes/console.php` or `app/Console/Kernel.php`:
+The padron import runs on the last day of each month at 03:00, as defined in `routes/console.php`. `withoutOverlapping()` prevents two concurrent runs from racing on the upsert — a full import can exceed one hour:
 
 ```php
-Schedule::job(new ImportarPadronDnitJob())->monthly();
+// routes/console.php
+Schedule::command('dnit:importar-padron')
+    ->lastDayOfMonth('3:00')
+    ->withoutOverlapping();
 ```
+
+After a successful full import, `ImportarPadronDnitJob` automatically enqueues `ValidarRucEmpresasJob` with a two-minute delay — there is no separate schedule entry for re-validation.
 
 <Tip>
   You can also trigger a single-segment import manually from Tinker for debugging: `ImportarPadronDnitJob::dispatchSync(0)` — this processes only the segment for RUCs starting with `0` and prints the log output inline.
@@ -206,3 +211,30 @@ Schedule::job(new ImportarPadronDnitJob())->monthly();
 <Warning>
   Do not run `ValidarRucEmpresasJob` manually immediately after a partial import (single-segment). A partial padron will mark companies from the unimported segments as `no_encontrado`. The auto-dispatch in `ImportarPadronDnitJob` only fires after a **complete** (all-segment) run for this reason.
 </Warning>
+
+## Environment Variables and Configuration
+
+Import behaviour is controlled by `config/dnit.php`. Each key is overridable via the environment:
+
+```ini
+# Per-segment padron URLs (check https://www.dnit.gov.py around the 1st of each month)
+DNIT_URL_PADRON_0=   # defaults to the hardcoded DNIT URL for digit 0
+DNIT_URL_PADRON_1=
+# ... through DNIT_URL_PADRON_9
+
+# HTTP timeout for downloading each ZIP (seconds, default 300)
+DNIT_HTTP_TIMEOUT=300
+
+# User-Agent sent with every download request
+DNIT_USER_AGENT=ExcedentMarket/1.0 (contacto@excedentmarket.com.py)
+
+# Rows per PostgreSQL upsert batch (default 2000)
+DNIT_BATCH_SIZE=2000
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DNIT_URL_PADRON_0` … `DNIT_URL_PADRON_9` | Hardcoded DNIT URLs | Direct download URLs for the ten padron ZIP segments. The `?t=` token changes with each publication; update these when the DNIT page changes. |
+| `DNIT_HTTP_TIMEOUT` | `300` | Per-segment download timeout in seconds. The ZIPs can exceed 20 MB each. |
+| `DNIT_USER_AGENT` | `ExcedentMarket/1.0 (...)` | User-Agent header sent with download requests. |
+| `DNIT_BATCH_SIZE` | `2000` | Rows per `DB::upsert()` call. Increase for faster imports on memory-rich hosts; decrease if PostgreSQL rejects oversized statements. |

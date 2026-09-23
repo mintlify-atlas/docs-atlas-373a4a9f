@@ -1,5 +1,5 @@
 ---
-title: "Web Routes and API Endpoints Reference"
+title: "Web Routes and API Endpoints: ExcedentMarket Reference"
 sidebarTitle: "Routes"
 description: "Complete route table for ExcedentMarket: public marketplace, guest auth, authenticated portal, offer management, privacy, and payment webhooks."
 ---
@@ -10,14 +10,15 @@ All HTTP routes for ExcedentMarket are defined in `web/routes/web.php`. The file
 
 ## Rate Limit Names
 
-Rate limits are **not** defined inside `web.php`. They are registered in `AppServiceProvider::registrarLimitesDePeticiones()` and referenced by name in `->middleware('throttle:…')`. The four names in use:
+Rate limits are **not** defined inside `web.php`. They are registered in `AppServiceProvider::registrarLimitesDePeticiones()` and referenced by name in `->middleware('throttle:…')`. The five names registered:
 
 | Name | Applied to | Purpose |
 |---|---|---|
-| `acceso` | `POST /login` | Brute-force protection on login |
-| `registro` | `POST /register` | Prevent registration spam |
-| `operaciones` | `POST /portal/marketplace/ofertas/{lote}`, `DELETE /portal/marketplace/ofertas/{oferta}` | Rate-limit marketplace writes |
-| `webhook` | `POST /api/pago/webhook` | Protect the payment callback endpoint |
+| `acceso` | `POST /login` | Brute-force protection on login: 5 req/min by IP + 15 req/min by email |
+| `registro` | `POST /register` | Prevent registration spam: 10 req/min by IP |
+| `operaciones` | `POST /portal/marketplace/ofertas/{lote}`, `DELETE /portal/marketplace/ofertas/{oferta}` | Rate-limit marketplace writes: 20 req/min by authenticated user (falls back to IP) |
+| `webhook` | `POST /api/pago/webhook` | Protect the payment callback endpoint: 60 req/min by IP |
+| `privacidad` | Registered but not yet applied to a route | Protects the privacy re-consent endpoint: 5 req/min by authenticated user (falls back to IP). Defined in `AppServiceProvider`; apply with `->middleware('throttle:privacidad')` when wiring the route. |
 
 <Note>
   GET routes for login and registration pages are intentionally **not** throttled. Applying a rate limit to the GET would prevent the user from returning to the form after a rejection.

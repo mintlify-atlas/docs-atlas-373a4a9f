@@ -1,5 +1,5 @@
 ---
-title: "Deploy ExcedentMarket with Docker Compose"
+title: "ExcedentMarket Deployment with Docker Compose Guide"
 sidebarTitle: "Deployment"
 description: "Step-by-step guide to building and deploying ExcedentMarket with Docker Compose, covering build targets, volumes, ports, and production hardening."
 ---
@@ -82,6 +82,9 @@ The `entrypoint.sh` runs this ordered sequence inside the container on every `up
   <Step title="Seed (first install only)">
     Detects a fresh database by counting rows in `users`. If zero: runs `shield:generate` first (defines all permissions), then `permission:cache-reset` (clears Spatie's permission cache), then `db:seed`. Reversing this order produces a `duplicate key … role_has_permissions` error.
   </Step>
+  <Step title="Create storage symlink">
+    Calls `php artisan storage:link` to publish the `storage/app/public` directory under `public/storage`, making uploaded files accessible via the web server. Skipped if the symlink already exists.
+  </Step>
   <Step title="Publish assets and clear caches">
     Runs `filament:assets`, clears all caches (config, route, view, event, icons, Filament components), then re-caches everything in production.
   </Step>
@@ -121,7 +124,7 @@ The `entrypoint.sh` runs this ordered sequence inside the container on every `up
 
 `server/security-headers.conf` is loaded by Apache in both targets via `a2enconf security-headers`. It sets the following HTTP response headers:
 
-- **`Strict-Transport-Security`** — `max-age=31536000; includeSubDomains; preload`. Forces HTTPS for one year. Only effective once deployed with a real TLS certificate; activating this on plain HTTP locks browsers out. The configuration is included by the Dockerfile only in the `prod` target.
+- **`Strict-Transport-Security`** — `max-age=31536000; includeSubDomains; preload`. Forces HTTPS for one year. The `security-headers.conf` file is enabled in the `base` Dockerfile stage and is therefore present in **both** `dev` and `prod` images. The header has no effect over plain HTTP (browsers ignore it), so it is harmless in development but immediately active once deployed behind a real TLS certificate.
 - **`X-Content-Type-Options: nosniff`** — Prevents browsers from MIME-sniffing uploaded files as HTML.
 - **`X-Frame-Options: SAMEORIGIN`** — Clickjacking protection for older browsers. Modern browsers rely on the `frame-ancestors` directive in the CSP middleware instead.
 - **`Referrer-Policy: strict-origin-when-cross-origin`** — Limits URL leakage when navigating from lot detail pages to the MADES SIAM portal or to Pagopar.

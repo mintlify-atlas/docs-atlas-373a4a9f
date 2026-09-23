@@ -235,7 +235,7 @@ A buyer can withdraw a `pendiente` offer from the lot detail page:
 DELETE /portal/marketplace/ofertas/{oferta}
 ```
 
-This calls `RetiroService` (via `OfertaController::retirar()`) which sets `estado = 'retirada'` and triggers `devolverLoteSiQuedoSinOfertas()`. The route requires authentication and rate-limiting (`throttle:operaciones`).
+This calls `OfertaService::retirarOferta()` (via `OfertaController::retirar()`) which sets `estado = 'retirada'` and triggers `devolverLoteSiQuedoSinOfertas()`. The route requires authentication and rate-limiting (`throttle:operaciones`). Note: `RetiroService` is a separate service that handles the physical delivery circuit (Entrega → Retiro → Recepción) after payment — it has no role in offer withdrawal.
 
 ## Public Document Verification
 

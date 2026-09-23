@@ -1,7 +1,7 @@
 ---
 title: "Admin Panel: Platform Oversight and Compliance Tools"
 sidebarTitle: "Admin"
-description: "The Admin panel provides full platform oversight: company management, environmental compliance, traceability monitoring, privacy requests, and system operations tools."
+description: "ExcedentMarket Admin panel: company management, license validation, traceability monitoring, privacy requests, audit logs, and system operations tools."
 ---
 
 The **Admin** panel is ExcedentMarket's command center for platform-level oversight. Administrators do not participate in day-to-day trading — they don't publish lots or submit offers. Instead, the Admin panel focuses on ensuring that every company operating on the platform holds the environmental authorizations required by **Ley N.° 294/93**, that the waste transfer chain meets the traceability standards expected of a circular economy marketplace, and that privacy obligations under **Ley N.° 7.593** are fulfilled. The panel is accessible at `/admin`; the direct login URL is `/admin/login`.
@@ -93,7 +93,7 @@ Stat::make('Residuos revalorizados (total)',
 
 ### Traceability index — `TrazabilidadWidget`
 
-Surfaces the platform's supply-chain traceability score: what proportion of evaluated lots completed all chain links, the average completeness per lot, and — critically — which link breaks the chain most often:
+Surfaces the platform's supply-chain traceability score across four stats: global completeness rate, completeness rate over adjudicated lots only, average chain links fulfilled per lot, and — critically — which link breaks the chain most often:
 
 ```php
 // web/app/Filament/Admin/Widgets/TrazabilidadWidget.php
@@ -105,9 +105,19 @@ Stat::make('Indice de trazabilidad', Numeros::porcentaje($resumen['proporcion'])
         TrazabilidadService::TOTAL_ESLABONES,
     )),
 
-Stat::make('La cadena se corta en',
-    $numero . ' · ' . $resumen['eslabones'][$numero]
-)->color('warning'),
+Stat::make('Trazabilidad sobre adjudicados', Numeros::porcentaje($resumen['proporcion_adjudicados']))
+    ->description(sprintf(
+        '%d de %d lotes adjudicados con la cadena completa',
+        $resumen['completos'],
+        $resumen['adjudicados'],
+    )),
+
+Stat::make('Completitud promedio', Numeros::porcentaje($resumen['indice_promedio']))
+    ->description('Promedio de eslabones cumplidos por lote'),
+
+// Only rendered when at least one chain break exists:
+Stat::make('La cadena se corta en', $numero . ' · ' . $resumen['eslabones'][$numero])
+    ->color('warning'),
 ```
 
 ### Compliance alerts
@@ -121,24 +131,7 @@ The two lowest-priority widgets act as a compliance to-do list:
 
 ## Resources
 
-The Admin panel organizes resources into three navigation groups:
-
-### Administración group
-
-<CardGroup cols={2}>
-  <Card title="EmpresaResource" icon="building-office">
-    Full CRUD for companies. Validates RUC against the DNIT/SET padrón via `RucDnitService`. Includes relation managers for licenses and published lots. The central entity that connects users to trading activity.
-  </Card>
-  <Card title="MaterialResource" icon="beaker">
-    Master catalogue of tradeable materials, including CO₂ emission factors per kg used by environmental calculations across the platform. Supports create, edit, and list operations.
-  </Card>
-  <Card title="ObjetivoAmbientalResource" icon="globe-alt">
-    Platform-level environmental objectives (ODS targets), used to evaluate whether the marketplace's cumulative impact is on track.
-  </Card>
-  <Card title="RucPadronResource" icon="identification">
-    Read-only mirror of the DNIT RUC padrón used for company verification. Supports search by RUC during company registration or validation.
-  </Card>
-</CardGroup>
+The Admin panel organizes its thirteen resources into five navigation groups that follow the operational flow from commercial activity through compliance and into system administration.
 
 ### Operación group
 
@@ -150,20 +143,22 @@ The Admin panel organizes resources into three navigation groups:
     View and supervise all contracts. Includes the `ConstanciaTransmision` relation manager for waste transfer certificates. Read-only from the admin perspective — contract creation is triggered by the offer acceptance flow.
   </Card>
   <Card title="OfertaResource" icon="currency-dollar">
-    Platform-wide offer listing with filters by state, company, and lot. Used to investigate disputed offers or investigate pricing patterns.
+    Platform-wide offer listing with filters by state, company, and lot. Used to investigate disputed offers or pricing patterns.
+  </Card>
+</CardGroup>
+
+### Administración group
+
+<CardGroup cols={2}>
+  <Card title="EmpresaResource" icon="building-office">
+    Full CRUD for companies. Validates RUC against the DNIT/SET padrón via `RucDnitService`. Includes relation managers for licenses and published lots. The central entity that connects users to trading activity.
   </Card>
   <Card title="LicenciaEmpresaResource" icon="identification">
     Validate, approve, or reject company environmental licenses (Ley N.° 294/93). Pending licenses are surfaced in `StatsOverviewWidget` and in `LicenciasProximasVencerWidget`. This resource gates a company's ability to publish lots or submit offers.
   </Card>
-  <Card title="DocumentoCertificacionResource" icon="document-check">
-    Platform-wide view of all compliance documents attached to companies and lots.
-  </Card>
-  <Card title="IncidenteSeguridadResource" icon="shield-exclamation">
-    Security incident log. Incidents are opened automatically by `DeteccionIncidentes` when brute-force thresholds are exceeded. Admins can create manual incidents, edit investigation notes, and track resolution.
-  </Card>
 </CardGroup>
 
-### Privacidad / Auditoría group
+### Cumplimiento group
 
 <CardGroup cols={2}>
   <Card title="SolicitudPrivacidadResource" icon="lock-closed">
@@ -172,6 +167,33 @@ The Admin panel organizes resources into three navigation groups:
   <Card title="PoliticaPrivacidadResource" icon="document">
     Manage privacy policy versions. Publishing a new version increments the active version number and triggers re-consent for all users on their next login.
   </Card>
+  <Card title="IncidenteSeguridadResource" icon="shield-exclamation">
+    Security incident log. Incidents are opened automatically by `DeteccionIncidentes` when brute-force thresholds are exceeded. Admins can create manual incidents, edit investigation notes, and track resolution.
+  </Card>
+  <Card title="RucPadronResource" icon="identification">
+    Read-only mirror of the DNIT RUC padrón used for company verification. Supports search by RUC during company registration or validation.
+  </Card>
+  <Card title="DocumentoCertificacionResource" icon="document-check">
+    Platform-wide view of all compliance documents attached to companies and lots.
+  </Card>
+</CardGroup>
+
+### Configuración Ambiental group
+
+<CardGroup cols={2}>
+  <Card title="MaterialResource" icon="beaker">
+    Master catalogue of tradeable materials, including CO₂ emission factors per kg used by environmental calculations across the platform. Supports create, edit, and list operations.
+  </Card>
+  <Card title="ObjetivoAmbientalResource" icon="globe-alt">
+    Platform-level environmental objectives (ODS targets), used to evaluate whether the marketplace's cumulative impact is on track.
+  </Card>
+</CardGroup>
+
+### Sistema group
+
+The **Sistema** group bundles the audit log resource with the three system-operations pages described in the next section.
+
+<CardGroup cols={2}>
   <Card title="AuditLogResource" icon="magnifying-glass">
     Immutable audit trail of all model changes captured by the audit package. Read-only list — no create, edit, or delete actions.
   </Card>

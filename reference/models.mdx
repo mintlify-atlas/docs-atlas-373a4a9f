@@ -50,6 +50,9 @@ ExcedentMarket's domain is expressed through eleven core Eloquent models that sp
     <ResponseField name="proceso_valorizacion" type="string">
       Free-text description of the valorization process.
     </ResponseField>
+    <ResponseField name="ciudad_id" type="integer">
+      FK to `ciudades`. Auto-derived from the warehouse at save time; overridable when the material is collected from a different location.
+    </ResponseField>
     <ResponseField name="lat / lng" type="decimal(10,8)">
       Pickup coordinates. Auto-derived from `almacen.lat/lng` unless a custom pickup point is declared.
     </ResponseField>
@@ -468,6 +471,9 @@ $oferta->contratoPropio();         // ?Contrato
     <ResponseField name="pasarela" type="string">
       Gateway identifier: `pagopar` or `dlocalgo`.
     </ResponseField>
+    <ResponseField name="transaccion_pasarela" type="string">
+      Raw transaction identifier returned by the gateway webhook.
+    </ResponseField>
     <ResponseField name="fecha_pago" type="datetime">
       When payment was credited.
     </ResponseField>
@@ -529,7 +535,10 @@ $oferta->contratoPropio();         // ?Contrato
       European Waste Catalogue (LER/EWC) code for cross-reference.
     </ResponseField>
     <ResponseField name="tipo_valorizacion_sugerido" type="string">
-      Suggested [`TipoValorizacion`](/reference/enums#tipovalorizacion) — auto-inherited by new lots.
+      Suggested [`TipoValorizacion`](/reference/enums#tipovalorizacion) — auto-inherited by new lots when `tipo_valorizacion` is not set.
+    </ResponseField>
+    <ResponseField name="proceso_valorizacion_sugerido" type="string">
+      Free-text description of the suggested valorization process. Also auto-inherited by new lots.
     </ResponseField>
     <ResponseField name="precio_referencia_min / precio_referencia_max" type="integer">
       Market price range in Guaraníes per unit. Used by seeders and `precioVerosimil()`.

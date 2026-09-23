@@ -37,8 +37,9 @@ The seed credentials listed in this guide are **for development only**. They are
   3. Runs `php artisan migrate --force`.
   4. Detects a first install by counting rows in the `users` table (not a file marker — so recreating only the database volume correctly triggers re-seeding).
   5. Runs `shield:generate --all --panel=admin` to define the full permission set, then `permission:cache-reset`, then `db:seed`. This order is mandatory: seeding before generating permissions causes a `duplicate key ... role_has_permissions` error.
-  6. Publishes Filament assets, clears caches, and creates the storage symlink.
-  7. Installs npm dependencies if missing, then starts the Vite HMR dev server on port 5173.
+  6. Creates the storage symlink, publishes Filament assets, and clears caches.
+  7. Corrects ownership of `storage/` and `bootstrap/cache/` so Apache (`www-data`) can write to them. The preceding Artisan commands run as `www-data` via `gosu`, but this step ensures any files created during the build or by prior runs with the wrong owner are fixed before Apache starts.
+  8. Installs npm dependencies if missing, then starts the Vite HMR dev server on port 5173.
 
   <Info>
   The `queue` and `scheduler` services wait for `web` to reach a healthy state before starting. Only `web` runs migrations and seeders; the workers share the same `APP_KEY` via the `app_state` volume so they can decrypt job payloads.
@@ -160,7 +161,7 @@ docker compose down -v && docker compose up -d --build
   docker compose exec web grep local.ERROR storage/logs/laravel.log | tail -3
   ```
 
-  The `entrypoint.sh` corrects ownership as a final step on every startup, so if this happens after a clean `up --build` it usually means a mid-run failure left files owned by root. Running `docker compose down -v && docker compose up -d --build` resolves it.
+  The `entrypoint.sh` corrects ownership of `storage/` and `bootstrap/cache/` at the start of every startup (before any Artisan command runs), so if this happens after a clean `up --build` it usually means a mid-run failure left files owned by root. Running `docker compose down -v && docker compose up -d --build` resolves it.
 </Accordion>
 
 <Accordion title="Frontend shows: Cannot read properties of null (reading 'component')">

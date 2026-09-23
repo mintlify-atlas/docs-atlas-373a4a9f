@@ -104,6 +104,9 @@ public function calcularAhorroPorEmpresa(Empresa $empresa): float
 
 // Platform-wide total: all completed contracts
 public function calcularAhorroTotal(): float
+
+// Format a kg value as a human-readable tonnes string (delegates to Unidades::toneladasFormateadas)
+public function formatearToneladas(float $kg): string
 ```
 
 All three methods delegate to `LotePublicado::co2EvitadoEstimado()`, which is the single definition of the metric across the whole system:
