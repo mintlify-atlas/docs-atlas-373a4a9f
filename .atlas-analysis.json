@@ -1,0 +1,125 @@
+{
+  "projectType": "saas",
+  "projectName": "ExcedentMarket",
+  "projectDescription": "A B2B marketplace for industrial waste and surplus materials in Paraguay, connecting waste generators with recyclers under a circular economy framework and Paraguay's Ley N.° 3956/2009.",
+  "theme": "palm",
+  "primaryColor": "#00685b",
+  "lightColor": "#e2f0ed",
+  "darkColor": "#00564b",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "User Roles & Panels",
+            "pages": [
+              "roles/overview",
+              "roles/generador",
+              "roles/reciclador",
+              "roles/admin"
+            ]
+          },
+          {
+            "group": "Core Features",
+            "pages": [
+              "features/marketplace",
+              "features/offers-contracts",
+              "features/payments",
+              "features/inventory",
+              "features/compliance"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/ruc-dnit",
+              "integrations/siam-mades",
+              "integrations/payment-gateways"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/deployment",
+              "operations/configuration",
+              "operations/notifications",
+              "operations/testing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Data Model",
+            "pages": [
+              "reference/models",
+              "reference/enums",
+              "reference/waste-classification"
+            ]
+          },
+          {
+            "group": "Services & Jobs",
+            "pages": [
+              "reference/services",
+              "reference/jobs",
+              "reference/payment-gateway-interface"
+            ]
+          },
+          {
+            "group": "Routes & Controllers",
+            "pages": [
+              "reference/routes",
+              "reference/filament-panels"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Public marketplace catalog with geographic filtering by Paraguay department/city",
+    "Full offer and counter-offer negotiation cycle between generators and recyclers",
+    "Contract lifecycle management with PDF generation and QR-verifiable documents",
+    "Unified payment gateway abstraction supporting Pagopar, DLocalGo, and a simulated gateway",
+    "RUC validation against the Paraguay DNIT taxpayer registry (local import)",
+    "Environmental license validation via SIAM (MADES online API)",
+    "CO2 savings estimation and ODS metrics tracking for circular economy reporting",
+    "Role-based access control with three Filament 5 panels (Admin, Generador, Reciclador)",
+    "ARCO privacy rights compliance (Ley N.° 7.593/2025) with data export and erasure",
+    "Traceability index across seven supply chain checkpoints",
+    "Automated background jobs: padron import, OCR license parsing, RUC batch validation",
+    "Dockerized deployment with PostgreSQL 16, queue worker, and scheduler containers"
+  ],
+  "publicApiSurface": [
+    "GET /marketplace — public catalog with filters (material, city, price range)",
+    "GET /marketplace/{id} — lot detail page",
+    "GET /marketplace/empresa/{id} — company profile with its lots",
+    "GET /marketplace/nearby/{id} — lots near a given lot (5 km radius)",
+    "POST /login — unified login with role-based redirect to /portal",
+    "POST /register — generator or recycler registration",
+    "POST /portal/marketplace/ofertas/{lote} — submit an offer on a lot",
+    "DELETE /portal/marketplace/ofertas/{oferta} — withdraw an offer",
+    "GET /portal/contratos/{contrato}/pagar — initiate payment checkout",
+    "POST /api/pago/webhook — payment gateway webhook receiver",
+    "GET /verificar/{codigo} — public document verification (manifests, certificates)",
+    "PaymentGateway::iniciar(Contrato, User): array — start a payment transaction",
+    "PaymentGateway::procesarWebhook(array, string): array — process gateway webhook",
+    "OfertaService::crearOferta(LotePublicado, int, int, array, CanalOferta): Oferta",
+    "CO2Service::calcularAhorroPorLote(LotePublicado): float",
+    "TrazabilidadService — traceability index across 7 supply chain checkpoints",
+    "RucDnitService::validarEmpresa(Empresa): array",
+    "LicenciaSiamService::descargarDeclaracion(int): ?string",
+    "PaymentGatewayManager::disponibles(): Collection"
+  ]
+}

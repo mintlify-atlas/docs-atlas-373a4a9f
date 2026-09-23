@@ -1,0 +1,342 @@
+---
+title: "PaymentGateway Interface: Implementing a Custom Gateway"
+sidebarTitle: "PaymentGateway"
+description: "Full reference for the PaymentGateway contract, each method's responsibilities, and a step-by-step guide to adding a new payment gateway to ExcedentMarket."
+---
+
+ExcedentMarket abstracts payment processing behind a single `App\Contracts\PaymentGateway` interface. Three implementations ship out of the box — `PagoparGateway`, `DLocalGoGateway`, and `SimuladoGateway` — and the `PaymentGatewayManager` discovers them all at boot time. Adding a fourth gateway means implementing this interface and registering the class; no other file needs to change.
+
+---
+
+## The Interface
+
+```php
+<?php
+// app/Contracts/PaymentGateway.php
+
+declare(strict_types=1);
+
+namespace App\Contracts;
+
+use App\Models\Contrato;
+use App\Models\Pago;
+use App\Models\User;
+
+interface PaymentGateway
+{
+    /**
+     * Nombre único de la pasarela (pagopar, dlocalgo, simulado)
+     */
+    public function nombre(): string;
+
+    /**
+     * Etiqueta para mostrar al usuario
+     */
+    public function etiqueta(): string;
+
+    /**
+     * Si la pasarela está disponible en el entorno actual
+     */
+    public function disponible(): bool;
+
+    /**
+     * Inicia una transacción y devuelve los datos necesarios para el checkout
+     *
+     * @return array{payment_id: string, redirect_url: string, order_id: string, pago: Pago}
+     */
+    public function iniciar(Contrato $contrato, User $comprador): array;
+
+    /**
+     * URL de checkout para un payment_id ya creado
+     */
+    public function urlCheckout(string $paymentId): string;
+
+    /**
+     * Procesa el webhook de la pasarela
+     *
+     * @return array Datos del webhook procesado
+     */
+    public function procesarWebhook(array $payload, string $firma): array;
+
+    /**
+     * Confirma/cancela un pago en modo simulado
+     */
+    public function confirmarSimulado(string $paymentId, bool $pagado, string $formaPago): Pago;
+
+    /**
+     * Consulta el estado de un pago
+     */
+    public function consultarEstado(string $paymentId): array;
+}
+```
+
+---
+
+## Method Reference
+
+### `nombre(): string`
+
+<ParamField body="return" type="string">
+  A lowercase machine name that uniquely identifies this gateway. Must be a value that `PaymentGatewayManager::get()` can look up by key. Existing values: `pagopar`, `dlocalgo`, `simulado`.
+</ParamField>
+
+Used as a dictionary key in `PaymentGatewayManager::$gateways` (a `Collection` keyed by this string). It also appears in `Pago` columns (`pago.pasarela`), in route parameters (`?pasarela=pagopar`), and in `match` expressions throughout `PaymentController`. Choose a name that is stable — renaming it after deployment breaks existing `Pago` rows.
+
+---
+
+### `etiqueta(): string`
+
+<ParamField body="return" type="string">
+  Human-readable display name shown in the checkout UI and in the `opcionesParaUsuario()` select. Example: `"Pago con tarjeta (dLocal Go)"`.
+</ParamField>
+
+`PaymentGatewayManager::opcionesParaUsuario()` returns `[$gateway->nombre() => $gateway->etiqueta()]` for all available gateways, and this map is what populates the payment method selector.
+
+---
+
+### `disponible(): bool`
+
+<ParamField body="return" type="bool">
+  `true` if the gateway can process payments in the current environment.
+</ParamField>
+
+`PaymentGatewayManager::disponibles()` filters the entire registry through this method. Implementations typically check whether the required env vars are non-empty:
+
+```php
+public function disponible(): bool
+{
+    return filled(config('services.pagopar.token'))
+        && filled(config('services.pagopar.public_key'));
+}
+```
+
+`SimuladoGateway` always returns `true` so that the sandbox has a working gateway with no credentials.
+
+---
+
+### `iniciar(Contrato $contrato, User $comprador): array`
+
+<ParamField body="contrato" type="Contrato" required>
+  The contract being paid. Must be in state `pendiente_pago`. The implementation must read pricing from `$contrato->monto_material`.
+</ParamField>
+
+<ParamField body="comprador" type="User" required>
+  The authenticated buyer initiating the payment. Used for buyer identification fields required by the gateway API.
+</ParamField>
+
+<ResponseField name="return" type="array">
+  Must match the shape declared in the PHPDoc:
+
+  ```php
+  [
+      'payment_id'   => string,  // gateway-specific payment identifier
+      'redirect_url' => string,  // URL to send the buyer to for checkout
+      'order_id'     => string,  // internal order reference
+      'pago'         => Pago,    // the created Pago model record
+  ]
+  ```
+
+  The implementation must create a `Pago` record and persist `payment_id` into the appropriate column (`pagopar_hash` or `dlocalgo_payment_id`). `PaymentController::iniciar()` redirects the buyer to `redirect_url` immediately after this call.
+</ResponseField>
+
+---
+
+### `urlCheckout(string $paymentId): string`
+
+<ParamField body="paymentId" type="string" required>
+  A `payment_id` previously created by `iniciar()`.
+</ParamField>
+
+<ResponseField name="return" type="string">
+  The checkout URL for a payment that already exists. Used when the buyer navigates back to the payment page after a partial session — `PaymentController::iniciar()` checks for an existing non-expired `Pago` and calls this method rather than creating a duplicate.
+</ResponseField>
+
+---
+
+### `procesarWebhook(array $payload, string $firma): array`
+
+<ParamField body="payload" type="array" required>
+  The parsed JSON body of the incoming webhook request.
+</ParamField>
+
+<ParamField body="firma" type="string" required>
+  The signature header value. For Pagopar this is empty (signature is embedded in the payload); for dLocal Go it comes from `V2-HMAC-SHA256`.
+</ParamField>
+
+<ResponseField name="return" type="array">
+  Implementation-defined. Typically includes payment status, the updated `Pago` model, and any gateway-specific fields. `PaymentController::webhook()` calls this and responds `200 OK` on success.
+</ResponseField>
+
+The implementation is responsible for:
+1. Verifying the signature
+2. Finding the `Pago` by `payment_id`
+3. Updating `pago.estado` to `pagado` or `fallido`
+4. Transitioning `contrato.estado` to `activo` when paid
+5. Dispatching `GenerarDocumentosContratoJob`
+
+---
+
+### `confirmarSimulado(string $paymentId, bool $pagado, string $formaPago): Pago`
+
+<ParamField body="paymentId" type="string" required>
+  The simulated payment identifier.
+</ParamField>
+
+<ParamField body="pagado" type="bool" required>
+  `true` to simulate a successful payment, `false` to simulate cancellation.
+</ParamField>
+
+<ParamField body="formaPago" type="string" required>
+  A label for the simulated payment method, e.g. `"Tarjeta de crédito"`.
+</ParamField>
+
+<ResponseField name="return" type="Pago">
+  The updated `Pago` record after simulated confirmation.
+</ResponseField>
+
+<Note>
+  Only `SimuladoGateway` provides a meaningful implementation. Other gateways may throw `\RuntimeException('No implementado')` — the `PaymentGatewayManager` delegates this call to the named gateway, so only the `simulado` gateway is ever asked to confirm a simulated payment.
+</Note>
+
+---
+
+### `consultarEstado(string $paymentId): array`
+
+<ParamField body="paymentId" type="string" required>
+  The payment identifier whose current state should be polled.
+</ParamField>
+
+<ResponseField name="return" type="array">
+  Gateway-specific status payload. `PaymentController::resultado()` calls this to render the post-checkout result page. The controller inspects `$estado['pagado']` (Pagopar/Simulado) or `$estado['status']` (dLocal Go) to determine the display state.
+</ResponseField>
+
+---
+
+## Adding a New Gateway
+
+<Steps>
+  <Step title="Create the implementation class">
+    Create `app/Services/Gateways/MiGatewayGateway.php` implementing `App\Contracts\PaymentGateway`. Use `SimuladoGateway` as a template for the method signatures.
+
+    ```php
+    // app/Services/Gateways/MiGatewayGateway.php
+
+    declare(strict_types=1);
+
+    namespace App\Services\Gateways;
+
+    use App\Contracts\PaymentGateway;
+    use App\Models\Contrato;
+    use App\Models\Pago;
+    use App\Models\User;
+
+    class MiGatewayGateway implements PaymentGateway
+    {
+        public function nombre(): string
+        {
+            return 'migateway';
+        }
+
+        public function etiqueta(): string
+        {
+            return 'Pago con MiGateway';
+        }
+
+        public function disponible(): bool
+        {
+            return filled(config('services.migateway.api_key'));
+        }
+
+        public function iniciar(Contrato $contrato, User $comprador): array
+        {
+            // 1. Call gateway API
+            // 2. Create Pago record
+            // 3. Return shape: payment_id, redirect_url, order_id, pago
+        }
+
+        // ... implement remaining methods
+    }
+    ```
+  </Step>
+
+  <Step title="Add env vars and config">
+    Add to `.env` and `.env.example`:
+
+    ```ini
+    MIGATEWAY_API_KEY=
+    MIGATEWAY_SECRET=
+    MIGATEWAY_ENV=sandbox
+    ```
+
+    Add a config block in `config/services.php`:
+
+    ```php
+    'migateway' => [
+        'api_key' => env('MIGATEWAY_API_KEY'),
+        'secret'  => env('MIGATEWAY_SECRET'),
+        'env'     => env('MIGATEWAY_ENV', 'sandbox'),
+    ],
+    ```
+  </Step>
+
+  <Step title="Register in AppServiceProvider">
+    The `PaymentGatewayManager` is bound as a singleton. Add your gateway to the registration call:
+
+    ```php
+    // app/Providers/AppServiceProvider.php
+
+    $this->app->singleton(PaymentGatewayManager::class, function ($app) {
+        return new PaymentGatewayManager([
+            $app->make(PagoparGateway::class),
+            $app->make(DLocalGoGateway::class),
+            $app->make(SimuladoGateway::class),
+            $app->make(MiGatewayGateway::class), // ← add here
+        ]);
+    });
+    ```
+  </Step>
+
+  <Step title="Add PaymentGatewayManager config entry">
+    Update the `names` array in `PaymentGatewayManager::$config` so the manager knows about the new gateway name:
+
+    ```php
+    public array $config = [
+        'names'   => ['pagopar', 'dlocalgo', 'simulado', 'migateway'],
+        'default' => 'dlocalgo',
+    ];
+    ```
+  </Step>
+
+  <Step title="Update PaymentController match expressions">
+    `PaymentController` has several `match ($nombrePasarela)` blocks for column names and vigency days. Add your gateway to each one, or refactor to delegate these decisions to the gateway itself.
+
+    ```php
+    $columnaPaymentId = match ($nombrePasarela) {
+        'pagopar'    => 'pagopar_hash',
+        'dlocalgo'   => 'dlocalgo_payment_id',
+        'simulado'   => 'pagopar_hash',
+        'migateway'  => 'migateway_payment_id', // ← add here
+    };
+    ```
+  </Step>
+
+  <Step title="Verify with the Simulado pattern">
+    Before wiring real credentials, confirm the full checkout flow works end-to-end using `SimuladoGateway` as a reference. The Admin panel includes a simulated payment confirmation action that exercises `confirmarSimulado()` without external calls.
+  </Step>
+</Steps>
+
+---
+
+## Built-in Gateways
+
+<CardGroup cols={3}>
+  <Card title="PagoparGateway" icon="credit-card">
+    Paraguay's most widely-used payment aggregator. Requires `PAGOPAR_TOKEN` and `PAGOPAR_PUBLIC_KEY`. Webhook signature is embedded in the payload (no header). Payment identifiers stored in `pago.pagopar_hash`.
+  </Card>
+  <Card title="DLocalGoGateway" icon="globe">
+    International card processing via dLocal. Requires `DLOCALGO_X_LOGIN`, `DLOCALGO_SECRET_KEY`, and `DLOCALGO_X_TRANS_KEY`. Webhook signature in `V2-HMAC-SHA256` header. Payment identifiers stored in `pago.dlocalgo_payment_id`.
+  </Card>
+  <Card title="SimuladoGateway" icon="flask">
+    Always `disponible()`. No credentials required. Stores in `pago.pagopar_hash`. Provides `confirmarSimulado()` for Admin panel testing. Falls back as `porDefecto()` when no real gateway is available.
+  </Card>
+</CardGroup>

@@ -1,0 +1,206 @@
+---
+title: "Environmental License Validation via MADES SIAM Portal"
+sidebarTitle: "SIAM / MADES"
+description: "How ExcedentMarket validates company environmental licenses online against Paraguay's MADES SIAM registry, including results, OCR, and expiry alerts."
+---
+
+Every company operating under Paraguay's **Ley N.° 3956/2009** circular economy framework must hold a valid environmental license issued by the **MADES** (Ministerio del Ambiente y Desarrollo Sostenible). ExcedentMarket validates these licenses against the MADES public registry system, **SIAM** (Sistema de Información Ambiental), to confirm that each submitted document matches the real expedition record. Unlike the DNIT padron — which is downloaded once and queried locally — SIAM is queried **online, per license**, in real time. This distinction governs the entire design of the integration: a network failure or MADES portal outage must never be misread as a rejection of a legitimate license.
+
+## Key Design Principle: Infrastructure Failures Are Not Rejections
+
+When the SIAM portal is unavailable, the system records `servicio_no_disponible` and retries on a back-off schedule. The license remains in whatever state it held before the attempt. Only a definitive, successful SIAM response can change the `validada_siam` flag to `true` or `false`. This prevents a MADES outage from inadvertently blocking companies from publishing waste lots.
+
+<Warning>
+  `servicio_no_disponible` is **not** a license rejection. It means the check could not be completed due to a network or portal issue. The empresa stays `pendiente` and the job retries up to three times on a 1 → 5 → 15 minute back-off.
+</Warning>
+
+---
+
+## Result Values
+
+The `ResultadoSiam` enum defines the five possible outcomes persisted to `licencias_empresa.siam_resultado`:
+
+```php
+enum ResultadoSiam: string
+{
+    case Coincide               = 'coincide';
+    case RucNoCoincide          = 'ruc_no_coincide';
+    case ExpedienteNoEncontrado = 'expediente_no_encontrado';
+    case ServicioNoDisponible   = 'servicio_no_disponible';
+    case SinExpediente          = 'sin_expediente';
+}
+```
+
+<Accordion title="What each result means">
+  <ResponseField name="coincide" type="string">
+    The expedition exists in SIAM and the RUC of the proposer (cedula field) matches the company's RUC. **Only this result sets `validada_siam = true`.** This is the normal, positive outcome.
+  </ResponseField>
+  <ResponseField name="ruc_no_coincide" type="string">
+    SIAM found the expedition number but it belongs to a different taxpayer. The submitted license document may be forged, reused, or entered incorrectly. Sets `validada_siam = false` and triggers `LicenciaSinCorrelatoSiamNotification`.
+  </ResponseField>
+  <ResponseField name="expediente_no_encontrado" type="string">
+    SIAM responded successfully but returned no records for the expedition number. The number may be mistyped or the license may not be in the active-resolutions layer queried by the system. Sets `validada_siam = false` and triggers `LicenciaSinCorrelatoSiamNotification`.
+  </ResponseField>
+  <ResponseField name="servicio_no_disponible" type="string">
+    The HTTP request to SIAM timed out, returned a non-2xx status, or the response body was not parseable JSON. **Does not change `validada_siam`.** The job retries automatically.
+  </ResponseField>
+  <ResponseField name="sin_expediente" type="string">
+    The `LicenciaEmpresa` record has no `expediente_siam` value to query. No HTTP call is made. The company must complete the license record before validation can proceed.
+  </ResponseField>
+</Accordion>
+
+<Note>
+  The `validada_siam` boolean is only ever set to `true` for `coincide`. For `servicio_no_disponible`, the column is left **unchanged** — a successful prior validation is never revoked by a network failure.
+</Note>
+
+---
+
+## LicenciaSiamService
+
+`LicenciaSiamService` is the online client for the MADES SIAM portal. All network calls live here; the job layer only dispatches work and handles retry/notification logic.
+
+### validarLicencia
+
+```php
+/**
+ * Valida una licencia contra el SIAM y persiste el resultado.
+ *
+ * @return array{resultado: string, detalle: array<string, mixed>}
+ */
+public function validarLicencia(LicenciaEmpresa $licencia): array
+```
+
+The returned `detalle` array contains the raw SIAM row data when the expedition was found: `proponente`, `cedula`, `nombre`, `tipoestudio`, `estado`, `exp_id`, `anho`, `consultado_at`, plus the computed `coincide_ruc`, `coincide_razon_social`, and `tipo_instrumento_siam` fields.
+
+The `tipo_instrumento_siam` field is resolved by `TipoInstrumentoSiam::desdeTipoEstudio()`, which maps SIAM's free-text `tipoestudio` values (e.g. `"INFORME DE AUDITORIA AMBIENTAL Y AJUSTES DE PGA"`) to the system's internal instrument enum using substring matching — because the MADES combines and varies these denominations freely.
+
+### buscarExpediente
+
+```php
+/**
+ * Consulta el listado publico por numero de expediente.
+ *
+ * @return array{estado: string, filas: list<array<string, mixed>>}
+ *         estado: 'ok' | 'no_disponible'
+ */
+public function buscarExpediente(string $expediente): array
+```
+
+The SIAM REST endpoint uses a `sSearch` parameter that searches across proposer name and denomination, not the expedition number directly. The service does an exact post-filter on `nroexpediente` (after normalising whitespace) to discard false-positive rows that mention the number incidentally.
+
+### descargarDeclaracion
+
+```php
+/**
+ * Descarga la declaracion o resolucion de un expediente.
+ *
+ * @return string|null  Bytes del PDF, o null si no se pudo obtener
+ */
+public function descargarDeclaracion(int $expId): ?string
+```
+
+<Warning>
+  **SIAM API quirk:** the declaration endpoint does not return a raw PDF file. It returns a JSON string containing the PDF **base64-encoded inside double quotes** — literally `"JVBERi0..."`. Saving the raw response body produces a file that starts with a double-quote character and cannot be opened by any PDF reader. `LicenciaSiamService::decodificarPdf()` handles all three possible response forms: the quoted base64 (current behaviour), bare base64, and a raw binary PDF (in case the endpoint changes in the future).
+</Warning>
+
+---
+
+## Validation Job
+
+`ValidarLicenciaSiamJob` is dispatched whenever a license is submitted or updated, and is also run on a weekly schedule by the admin scheduler (`siam:validar-licencias`). It runs in the `default` queue so that the standard `queue:work` worker in Docker Compose picks it up without any `--queue` flag.
+
+```php
+class ValidarLicenciaSiamJob implements ShouldQueue
+{
+    public int $tries   = 3;
+    public int $timeout = 60;
+
+    /** @var list<int> */
+    public array $backoff = [60, 300, 900]; // 1 min, 5 min, 15 min
+}
+```
+
+When `servicio_no_disponible` is returned and there are remaining attempts, the job releases itself back onto the queue with the appropriate back-off delay instead of failing immediately. A MADES portal outage typically lasts minutes or hours, so rapid retries would just fill the queue.
+
+After all attempts are exhausted with `servicio_no_disponible`, `failed()` logs a warning and the license remains in its prior state. No notification is sent — the infrastructure problem is not the empresa's fault.
+
+---
+
+## Notifications
+
+<CardGroup cols={2}>
+  <Card title="LicenciaSinCorrelatoSiamNotification" icon="triangle-exclamation">
+    Sent to the empresa's contact users **and** all admins when a validation result changes to `ruc_no_coincide` or `expediente_no_encontrado`. Comparing against the previous result (`$anterior`) ensures the same alert is never sent twice for the same unchanged negative verdict.
+  </Card>
+  <Card title="LicenciaProximaVencerNotification" icon="calendar-xmark">
+    Scheduled alert for licenses whose `fecha_proxima_auditoria` (derived from `fecha_firma + intervalo_auditoria_meses`) falls within the configured warning window. Includes licenses already past their audit deadline, which keep appearing until renewed.
+  </Card>
+</CardGroup>
+
+---
+
+## OCR Post-Processing
+
+After a license PDF is uploaded, `ProcesarOcrLicenciaJob` runs OCR via the `ReconocimientoOptico` / `PdfTextoExtractor` pipeline to extract structured metadata from the document (expedition number, resolution number, signing date, audit interval). The extracted data populates the `datos_ocr` JSON column.
+
+The system distinguishes **who requested the extraction**:
+
+| Requester | `solicitada_por` value | Counts as verification? |
+|---|---|---|
+| Company uploading their own document | `empresa` | No |
+| Admin running verification | `administracion` | Yes |
+| Automatic system trigger on upload | `sistema` | No |
+
+This distinction prevents a company's own OCR run from appearing as completed admin verification work.
+
+<Tip>
+  When the OCR confidence score (`confianza_parseo`) falls below `LicenciaMetadataParser::UMBRAL_CONFIANZA`, `LicenciaEmpresa::parseoDudoso()` returns `true` and the panel shows a low-confidence warning. Extracted data should be treated as a hint, not a verified fact.
+</Tip>
+
+---
+
+## License Validity Model
+
+License validity is **derived**, not stored manually. The `licencias_empresa` table has no hand-entered expiry date column. Instead, validity is computed from:
+
+```
+fecha_proxima_auditoria = fecha_firma + intervalo_auditoria_meses
+```
+
+This materialised column is recalculated on every save and is enforced by a PostgreSQL CHECK constraint. Three validity states result:
+
+<Accordion title="Validity states">
+  <ResponseField name="vigente" type="string">
+    `fecha_proxima_auditoria` is set and is in the future. The audit is within its deadline.
+  </ResponseField>
+  <ResponseField name="vencida" type="string">
+    `fecha_proxima_auditoria` is set and is in the past. The audit period has expired. A vencida license blocks lot publication and cannot be approved — attempting to approve it throws a `DomainException`.
+  </ResponseField>
+  <ResponseField name="indeterminada" type="string">
+    `fecha_proxima_auditoria` is `null` because either `fecha_firma` or `intervalo_auditoria_meses` is missing. Blocks publication the same way a vencida does, but the corrective action is different: complete the missing data, not renew with MADES.
+  </ResponseField>
+</Accordion>
+
+---
+
+## Configuration
+
+SIAM endpoints are configured in `config/services.php` and read from environment variables:
+
+```php
+'siam' => [
+    'rest'        => env('SIAM_REST_URL'),
+    'declaracion' => env('SIAM_DECLARACION_URL'),
+    'portal'      => env('SIAM_PORTAL_URL'),
+    'estado'      => env('SIAM_ESTADO', 20),
+    'timeout'     => env('SIAM_TIMEOUT', 30),
+],
+```
+
+| Variable | Purpose |
+|---|---|
+| `SIAM_REST_URL` | Base URL for the DataTables REST endpoint (`?sSearch=…`) |
+| `SIAM_DECLARACION_URL` | Base URL for the declaration download endpoint (`/{expId}`) |
+| `SIAM_PORTAL_URL` | Public portal URL shown in audit links for administrators |
+| `SIAM_ESTADO` | Filter code for approved resolutions (default `20`) |
+| `SIAM_TIMEOUT` | HTTP timeout per request in seconds (default `30`) |

@@ -1,0 +1,286 @@
+---
+title: "Payment Gateways: Pagopar, DLocalGo, and Simulated"
+sidebarTitle: "Payment Gateways"
+description: "ExcedentMarket's pluggable payment gateway layer: the PaymentGateway interface, Pagopar, dLocal Go, the Simulated gateway, and how to add a new one."
+---
+
+ExcedentMarket processes marketplace payments through a pluggable gateway layer. Three implementations are shipped: **Pagopar** (Paraguay-native), **dLocal Go** (the production default), and **Simulado** (an in-process fake used for development and demos). All three implement the same `PaymentGateway` contract, are registered as singletons in `AppServiceProvider`, and are resolved through a single `PaymentGatewayManager` — business logic never calls gateway classes directly. Every gateway supports an explicit `simulado` mode that runs entirely in-process so the full payment confirmation flow can be exercised without moving real money.
+
+---
+
+## The PaymentGateway Interface
+
+All gateways implement `App\Contracts\PaymentGateway`:
+
+```php
+interface PaymentGateway
+{
+    /**
+     * Nombre único de la pasarela (pagopar, dlocalgo, simulado)
+     */
+    public function nombre(): string;
+
+    /**
+     * Etiqueta para mostrar al usuario
+     */
+    public function etiqueta(): string;
+
+    /**
+     * Si la pasarela está disponible en el entorno actual
+     */
+    public function disponible(): bool;
+
+    /**
+     * Inicia una transacción y devuelve los datos necesarios para el checkout
+     *
+     * @return array{payment_id: string, redirect_url: string, order_id: string, pago: Pago}
+     */
+    public function iniciar(Contrato $contrato, User $comprador): array;
+
+    /**
+     * URL de checkout para un payment_id ya creado
+     */
+    public function urlCheckout(string $paymentId): string;
+
+    /**
+     * Procesa el webhook de la pasarela
+     *
+     * @return array Datos del webhook procesado
+     */
+    public function procesarWebhook(array $payload, string $firma): array;
+
+    /**
+     * Confirma/cancela un pago en modo simulado
+     */
+    public function confirmarSimulado(string $paymentId, bool $pagado, string $formaPago): Pago;
+
+    /**
+     * Consulta el estado de un pago
+     */
+    public function consultarEstado(string $paymentId): array;
+}
+```
+
+<Note>
+  `confirmarSimulado()` is defined on the interface so that the Admin panel's payment confirmation screen can call it uniformly regardless of which gateway is active. In production-mode gateways, webhook handlers fulfil the same role; the simulated confirmation screen replaces the webhook flow for development.
+</Note>
+
+---
+
+## PaymentGatewayManager
+
+`PaymentGatewayManager` is the single dependency that application code injects. It holds all registered gateways and exposes filtered views:
+
+```php
+class PaymentGatewayManager
+{
+    /** Configuracion central: nombres, default, orden. */
+    public array $config = [
+        'names'   => ['pagopar', 'dlocalgo', 'simulado'],
+        'default' => 'dlocalgo',
+    ];
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="disponibles()" icon="check-circle">
+    Returns only the gateways for which `disponible()` returns `true`. Used to build checkout option lists.
+  </Card>
+  <Card title="opcionesParaUsuario()" icon="list">
+    Returns an associative array `[nombre => etiqueta]` of available gateways, ready to populate a select input.
+  </Card>
+  <Card title="porDefecto()" icon="star">
+    Returns the first non-simulated available gateway, falling back to `simulado`. Priority ensures that if any real gateway is configured and available, it takes precedence.
+  </Card>
+  <Card title="get(string $nombre)" icon="arrow-pointer">
+    Fetches a specific gateway by its slug (`'pagopar'`, `'dlocalgo'`, `'simulado'`). Returns `null` if not found.
+  </Card>
+</CardGroup>
+
+The manager also exposes `iniciar()`, `urlCheckout()`, `procesarWebhook()`, `confirmarSimulado()`, and `consultarEstado()` as pass-through helpers that look up the gateway by name and delegate to it, plus `detectarPorPaymentId()` which identifies the correct gateway by matching a `payment_id` against `pagos.dlocalgo_payment_id` or `pagos.pagopar_hash`.
+
+---
+
+## Service Container Registration
+
+All three gateways are registered as singletons in `AppServiceProvider::register()`:
+
+```php
+$this->app->singleton(PagoparService::class);
+$this->app->singleton(DLocalGoService::class);
+
+$this->app->singleton(PaymentGatewayManager::class, function ($app) {
+    return new PaymentGatewayManager([
+        new PagoparGateway($app->make(PagoparService::class)),
+        new DLocalGoGateway($app->make(DLocalGoService::class)),
+        new SimuladoGateway($app->make(PagoparService::class)),
+    ]);
+});
+```
+
+`SimuladoGateway` wraps `PagoparService` because it reuses the same local-payment and confirmation logic; its `disponible()` delegates to `PagoparService::esSimulado()`.
+
+---
+
+## Gateways
+
+<Tabs>
+  <Tab title="Pagopar">
+
+**Pagopar** is Paraguay's dominant local payment gateway and the country-native option for buyers who prefer to pay through local channels (bank transfer, pharmacy networks, credit card). `PagoparGateway` wraps `PagoparService`.
+
+### How it works
+
+1. `iniciar()` calls `PagoparService::iniciarTransaccion()`, which `POST`s to `/api/comercios/2.0/iniciar-transaccion` and receives a hash from Pagopar.
+2. The buyer is redirected to `https://www.pagopar.com/pagos/{hash}`.
+3. Pagopar calls the registered webhook URL when the payment is resolved.
+4. `procesarWebhook()` validates the HMAC token (`sha1(privateKey + hashPedido)`), checks the amount, and updates the `Pago` record.
+
+### Webhook security
+
+The token is `sha1(private_key + hash_pedido)`. **This is why mode must be explicit (`PAGOPAR_MODO=real`)** — in simulated mode there is no private key, so the expected token would be `sha1('' + hash)`, which is trivially reproducible by anyone who observes the checkout URL.
+
+### Simulated mode
+
+When `PAGOPAR_MODO` is not `real`, the hash is generated locally with a `SIM-` prefix (e.g. `SIM-01j9k...`). The buyer is redirected to the internal `/pago/simulado?payment_id=...` page instead of Pagopar's servers. Calling `confirmarSimulado()` completes the flow exactly as a real webhook would.
+
+### Environment variables
+
+```ini
+PAGOPAR_MODO=simulado          # simulado | real
+PAGOPAR_PUBLIC_KEY=
+PAGOPAR_PRIVATE_KEY=
+PAGOPAR_API_URL=https://api.pagopar.com
+PAGOPAR_CHECKOUT_URL=https://www.pagopar.com/pagos
+PAGOPAR_WEBHOOK_URL=
+PAGOPAR_RETURN_URL=
+```
+
+  </Tab>
+  <Tab title="dLocal Go">
+
+**dLocal Go** is the **default gateway** (`PaymentGatewayManager::$config['default'] = 'dlocalgo'`) and the recommended choice for production deployments. It supports Paraguayan and regional payment methods via a redirect flow. `DLocalGoGateway` wraps `DLocalGoService`.
+
+### How it works
+
+1. `iniciar()` calls `DLocalGoService::iniciarTransaccion()`, which `POST`s to `/v1/payments` with a `REDIRECT` payment method flow and receives `id` + `redirect_url` from dLocal Go.
+2. The buyer is redirected to dLocal Go's hosted checkout (`redirect_url`).
+3. dLocal Go calls the configured notification URL when the payment status changes.
+4. `procesarWebhook()` validates the V2-HMAC-SHA256 signature (`HMAC_SHA256(api_key + rawBody, secret_key)`) and applies the result.
+
+### dLocalGo-specific column
+
+The migration `2026_09_18_000001_add_dlocalgo_payment_id_to_pagos` adds `dlocalgo_payment_id` (and `dlocalgo_order_id`) to the `pagos` table. These columns store dLocal Go's own `id` alongside the internal order reference, enabling reliable webhook reconciliation and idempotency checks.
+
+### Simulated mode
+
+When `DLOCALGO_MODO` is not `real`, a `SIM-` prefixed ULID is used as the payment ID, `pasarela` is set to `dlocalgo_simulado`, and the buyer lands on the internal simulation screen. Webhook processing is blocked in this mode.
+
+### Environment variables
+
+```ini
+DLOCALGO_MODO=simulado                           # simulado | real
+DLOCALGO_API_KEY=
+DLOCALGO_SECRET_KEY=
+DLOCALGO_BASE_URL=https://api-sbx.dlocalgo.com  # sandbox default
+DLOCALGO_WEBHOOK_SECRET=
+DLOCALGO_NOTIFICATION_URL=
+DLOCALGO_CALLBACK_URL=
+```
+
+  </Tab>
+  <Tab title="Simulado">
+
+**SimuladoGateway** is a pure development and demo gateway. It delegates to `PagoparService` in simulated mode — no HTTP calls are made to any external service.
+
+```php
+public function disponible(): bool
+{
+    return $this->service->esSimulado();
+}
+```
+
+`disponible()` returns `true` only when `PagoparService::esSimulado()` is true (i.e. `PAGOPAR_MODO` is not `real`). In a production environment with real Pagopar credentials, `SimuladoGateway` becomes unavailable automatically.
+
+`procesarWebhook()` throws a `RuntimeException` — there is no external party to call this endpoint in simulation, and it should never be registered as a webhook URL with any real payment provider.
+
+`confirmarSimulado()` is the primary interaction point: it mirrors exactly what a real webhook does (updates the `Pago` record, transitions the `Contrato` to `activo`, emits payment documents, sends `PagoConfirmadoNotification`) without touching any payment network.
+
+  </Tab>
+</Tabs>
+
+---
+
+## Idempotency and Webhook Retries
+
+Both Pagopar and dLocal Go retry their webhook notifications until they receive an HTTP 200. All `procesarWebhook()` implementations are **idempotent**:
+
+```php
+// Pagopar example — already-paid payments are silently skipped
+if ($pago->estado === 'pagado' && $pagado) {
+    Log::info('Pagopar webhook: reintento sobre un cobro ya acreditado, se ignora', [
+        'hash'    => $hashPedido,
+        'pago_id' => $pago->id,
+    ]);
+    return $resultado;
+}
+```
+
+Without this guard, every retry would re-send `PagoConfirmadoNotification` to both companies and re-emit the payment receipt PDF.
+
+---
+
+## Payment State Machine
+
+Once a payment is confirmed, `aplicarResultado()` (private to both `PagoparService` and `DLocalGoService`) transitions the associated `Contrato` to `activo` and emits two documents: a receipt for the Generador and a payment certificate for the Reciclador.
+
+| Pago state | Trigger | Contrato effect |
+|---|---|---|
+| `pendiente` | `iniciar()` called | no change |
+| `pagado` | Webhook `pagado=true` / `confirmarSimulado(true)` | → `activo` |
+| `fallido` | Webhook `cancelado=true` / `confirmarSimulado(false)` | no change |
+| `reembolsado` | Webhook reverts a previously confirmed payment | → `incumplido` (terminal) |
+
+<Warning>
+  A reversed payment (`reembolsado`) moves the contract to `incumplido`, a terminal state. The contract is **not** rolled back to `pendiente_pago` because `ContratoObserver` already emitted the constancia and ODS certificates when it first transitioned to `activo`. Rolling back would trigger a duplicate emission on the next payment attempt.
+</Warning>
+
+---
+
+## Adding a New Gateway
+
+<Steps>
+  <Step title="Implement the interface">
+    Create a class that implements `App\Contracts\PaymentGateway`. All seven methods are required. Choose a unique lowercase slug for `nombre()` (e.g. `'bancard'`).
+
+    ```php
+    class BancardGateway implements PaymentGateway
+    {
+        public function nombre(): string   { return 'bancard'; }
+        public function etiqueta(): string { return 'Bancard'; }
+        public function disponible(): bool { return config('services.bancard.enabled', false); }
+        // ... implement remaining methods
+    }
+    ```
+  </Step>
+  <Step title="Register in AppServiceProvider">
+    Add the new gateway to the `PaymentGatewayManager` singleton factory in `AppServiceProvider::register()`:
+
+    ```php
+    $this->app->singleton(PaymentGatewayManager::class, function ($app) {
+        return new PaymentGatewayManager([
+            new PagoparGateway($app->make(PagoparService::class)),
+            new DLocalGoGateway($app->make(DLocalGoService::class)),
+            new SimuladoGateway($app->make(PagoparService::class)),
+            new BancardGateway($app->make(BancardService::class)), // ← new
+        ]);
+    });
+    ```
+  </Step>
+  <Step title="The manager picks it up automatically">
+    `PaymentGatewayManager::disponibles()` filters by `disponible()`, and `opcionesParaUsuario()` builds the checkout dropdown from that filtered list. No changes are needed in any controller or Filament resource — they all go through the manager.
+  </Step>
+  <Step title="Add environment variables and config">
+    Add entries to `config/services.php` reading from `.env`, and document them in `.env.example`. Follow the pattern of the existing gateways: an explicit `modo` key (`simulado | real`) that prevents accidental live-mode operation when credentials are missing.
+  </Step>
+</Steps>

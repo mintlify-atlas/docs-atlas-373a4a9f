@@ -1,0 +1,414 @@
+---
+title: "PHP Enums: States, Channels, Units, and Classifications"
+sidebarTitle: "Enums"
+description: "Reference for all PHP 8.1 backed string enums in ExcedentMarket: values, labels, colors, and helper methods for every state machine and classification."
+---
+
+ExcedentMarket uses PHP 8.1 backed string enums as the single authoritative source for every state machine, classification, and controlled vocabulary in the system. Each enum value is stored as-is in the database; labels, colors, and derived behavior are methods on the enum itself — never scattered across Filament resources or React components. This page documents every enum in `app/Enums/`, with the actual backed values from source.
+
+---
+
+## EstadoLote
+
+Governs the lifecycle of a `LotePublicado`. The subsets `ESTADOS_VISIBLES`, `ESTADOS_RESERVAN_STOCK`, and `ESTADOS_CONGELADOS` live in `LotePublicado` rather than here because they are business rules that also drive database scopes and stock accounting.
+
+```php
+enum EstadoLote: string
+{
+    case Borrador      = 'borrador';
+    case Publicado     = 'publicado';
+    case EnNegociacion = 'en_negociacion';
+    case Adjudicado    = 'adjudicado';
+    case Cerrado       = 'cerrado';
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Labels & Colors">
+
+| Value | `etiqueta()` | `color()` |
+|---|---|---|
+| `borrador` | Borrador | `gray` |
+| `publicado` | Publicado | `success` |
+| `en_negociacion` | En negociación | `warning` |
+| `adjudicado` | Adjudicado | `info` |
+| `cerrado` | Cerrado | `danger` |
+
+  </Card>
+  <Card title="Static Helpers">
+
+```php
+// All backed values as a flat list
+EstadoLote::valores();
+// ['borrador', 'publicado', 'en_negociacion', 'adjudicado', 'cerrado']
+
+// value => label map (for Filament selects/filters)
+EstadoLote::etiquetas();
+
+// Tolerant label lookup (returns the raw string if unknown)
+EstadoLote::etiquetaDe('en_negociacion'); // 'En negociación'
+EstadoLote::colorDe('publicado');          // 'success'
+```
+
+  </Card>
+</CardGroup>
+
+<Info>
+  The label `en_negociacion` was written three different ways across the codebase before this enum was introduced — "En Negociacion", "En negociacion", and "En negociación". The canonical spelling is **"En negociación"** (with tilde) and lives exclusively in `etiqueta()`.
+</Info>
+
+---
+
+## EstadoContrato
+
+Lifecycle states for a `Contrato`. Introduced to eliminate divergent spellings of "Pendiente de pago" / "Pendiente de Pago" across nine Filament screens.
+
+```php
+enum EstadoContrato: string
+{
+    case PendientePago = 'pendiente_pago';
+    case Activo        = 'activo';
+    case Completado    = 'completado';
+    case Cancelado     = 'cancelado';
+    case Incumplido    = 'incumplido';
+}
+```
+
+| Value | `etiqueta()` | `color()` |
+|---|---|---|
+| `pendiente_pago` | Pendiente de pago | `warning` |
+| `activo` | Activo | `info` |
+| `completado` | Completado | `success` |
+| `cancelado` | Cancelado | `danger` |
+| `incumplido` | Incumplido | `danger` |
+
+Static helpers: `valores()`, `etiquetas()`, `etiquetaDe(?string)`, `colorDe(?string)`.
+
+---
+
+## EstadoOferta
+
+States for an `Oferta`. The `contrarrestada` value was rendered as both "Contraofertada" and "Contrarrestada" before canonicalization — **the stored value remains `contrarrestada`; the label is "Contraofertada"**.
+
+```php
+enum EstadoOferta: string
+{
+    case Pendiente      = 'pendiente';
+    case Contrarrestada = 'contrarrestada';
+    case Aceptada       = 'aceptada';
+    case Rechazada      = 'rechazada';
+    case Retirada       = 'retirada';
+}
+```
+
+| Value | `etiqueta()` | `color()` | Meaning |
+|---|---|---|---|
+| `pendiente` | Pendiente | `warning` | Awaiting generator response. |
+| `contrarrestada` | Contraofertada | `info` | Generator issued a counter-offer; buyer must respond. |
+| `aceptada` | Aceptada | `success` | Offer accepted; contract created. |
+| `rechazada` | Rechazada | `danger` | Offer rejected by generator. |
+| `retirada` | Retirada | `gray` | Buyer withdrew the offer (only possible from `pendiente`). |
+
+Static helpers: `valores()`, `etiquetas()`, `etiquetaDe(?string)`, `colorDe(?string)`.
+
+<Info>
+  The constants `Oferta::ESTADOS_ACTIVOS` and `Oferta::ESTADOS_EN_NEGOCIACION` live in the `Oferta` model, not here, because they also drive the partial unique index that prevents duplicate active bids.
+</Info>
+
+---
+
+## EstadoPago
+
+States for a `Pago`. The `reembolsado` case is distinct from `fallido` because a reversal (payment was credited, then reversed) requires a different business response than a charge that never succeeded.
+
+```php
+enum EstadoPago: string
+{
+    case Pendiente   = 'pendiente';
+    case Pagado      = 'pagado';
+    case Fallido     = 'fallido';
+    case Reembolsado = 'reembolsado';
+}
+```
+
+| Value | `etiqueta()` | `color()` |
+|---|---|---|
+| `pendiente` | Pendiente | `warning` |
+| `pagado` | Pagado | `success` |
+| `fallido` | Fallido | `danger` |
+| `reembolsado` | Reembolsado | `gray` |
+
+Static helpers: `valores()`, `etiquetas()`, `etiquetaDe(?string)`, `colorDe(?string)`.
+
+---
+
+## CanalOferta
+
+Records where an offer was submitted from. The column has **no database default** — every insertion point must declare it explicitly.
+
+```php
+enum CanalOferta: string
+{
+    case Marketplace = 'marketplace';
+    case Panel       = 'panel';
+}
+```
+
+| Value | `etiqueta()` | Description |
+|---|---|---|
+| `marketplace` | Marketplace | Submitted via the public Inertia/React marketplace UI. |
+| `panel` | Panel | Submitted via the Filament Reciclador panel action "Hacer oferta". |
+
+<Note>
+  This field was added after a manual testing session (2026-09-16) revealed that when offer amounts were inconsistent, there was no way to determine which entry point had produced them. It is the primary diagnostic for FR-048 (offer audit trail).
+</Note>
+
+---
+
+## ClaseResiduo
+
+Waste classification per Decreto N.° 7.391/17, Art. 8, reglamentando Ley N.° 3956/2009. **The letters A, B, C are internal system codes** — the decree itself does not use letter designations. See [Waste Classification](/reference/waste-classification) for the full regulatory context.
+
+```php
+enum ClaseResiduo: string
+{
+    case A = 'A';
+    case B = 'B';
+    case C = 'C';
+}
+```
+
+<CardGroup cols={3}>
+  <Card title="Class A — Peligroso" icon="triangle-exclamation">
+    Residuo peligroso (Ley N.° 567/95, Convenio de Basilea).
+
+    - `esPeligroso()` → `true`
+    - `esComercializable()` → `false`
+    - `motivoExclusion()` → "Es un residuo peligroso…"
+  </Card>
+  <Card title="Class B — Manejo Especial" icon="circle-exclamation">
+    Residuos de manejo especial (Decreto N.° 7.391/17, Art. 8, apartado II, incisos ≠ b).
+
+    - `esPeligroso()` → `false`
+    - `esComercializable()` → `false`
+    - `motivoExclusion()` → "Es un residuo de manejo especial con circuito de valorización propio…"
+  </Card>
+  <Card title="Class C — Industrial No Peligroso" icon="circle-check">
+    Decreto N.° 7.391/17, Art. 8, apartado II, inciso b.
+
+    - `esPeligroso()` → `false`
+    - `esComercializable()` → `true`
+    - `motivoExclusion()` → `null`
+  </Card>
+</CardGroup>
+
+```php
+// Shared constant with Material::CLASE_PELIGROSA
+ClaseResiduo::A->value === Material::CLASE_PELIGROSA; // true
+
+// Tolerant constructor (uppercases the input)
+ClaseResiduo::desde('c');  // ClaseResiduo::C
+ClaseResiduo::desde(null); // null
+
+// Full catalogue for the UI (includes Class A for historical lots)
+ClaseResiduo::catalogo();
+// Returns: [
+//   ['clase' => 'A', 'etiqueta' => 'Peligroso', 'descripcion' => '...', 'peligroso' => true],
+//   ['clase' => 'B', ...],
+//   ['clase' => 'C', ..., 'peligroso' => false],
+// ]
+```
+
+<Warning>
+  `esComercializable()` is expressed in **positive terms** (`=== self::C`). Class B is excluded not because it is hazardous — it is not — but because it has its own municipal/EPR valorization channel (tires, construction waste, e-waste). The system must be able to distinguish a "not-this-market" exclusion from a hazardous exclusion; `motivoExclusion()` provides separate messages for each.
+</Warning>
+
+---
+
+## TipoValorizacion
+
+A four-level circular-economy valorization hierarchy, inspired by ISO 59004:2024 (adopted in Paraguay as PNP-ISO 59004, 2026). **This is an original ordinal scale built for this system** — the ISO standard itself does not number the action families.
+
+```php
+enum TipoValorizacion: string
+{
+    case Reutilizacion = 'reutilizacion'; // Level 1 — most circular
+    case Remanufactura = 'remanufactura'; // Level 2
+    case Reciclaje     = 'reciclaje';     // Level 3 (default)
+    case Recuperacion  = 'recuperacion';  // Level 4 — least circular
+}
+```
+
+| Value | `etiqueta()` | Level | `peso()` | ISO 59004 Family |
+|---|---|---|---|---|
+| `reutilizacion` | Reutilización directa | 1 | 4.0 | 6.3 — Retener valor |
+| `remanufactura` | Remanufactura / Restauración | 2 | 3.0 | 6.3 — Retener valor |
+| `reciclaje` | Reciclaje de material | 3 | 2.0 | 6.4 — Recuperar valor |
+| `recuperacion` | Recuperación de energía/valor | 4 | 1.0 | 6.4 — Recuperar valor |
+
+```php
+// Level is derived from declaration order — no hardcoded integers
+TipoValorizacion::Reutilizacion->nivel(); // 1
+TipoValorizacion::Recuperacion->nivel();  // 4
+
+// Score contribution to the lot's circular quality (out of 4)
+TipoValorizacion::Reutilizacion->peso();  // 4.0
+TipoValorizacion::Recuperacion->peso();   // 1.0
+
+// Default when a lot does not declare valorization
+TipoValorizacion::porDefecto(); // TipoValorizacion::Reciclaje
+
+// Tolerant constructor
+TipoValorizacion::desde('reutilizacion'); // TipoValorizacion::Reutilizacion
+TipoValorizacion::desde(null);            // null
+
+// SQL fragment for the circularidad index (ActualizarMetricasOdsJob)
+TipoValorizacion::sqlNivel('tipo_valorizacion');
+
+// Full hierarchy for the frontend (replaces the JS copy)
+TipoValorizacion::jerarquia();
+```
+
+<Note>
+  The `nivel()` and `peso()` methods are derived from the **declaration order** of cases in the enum. Adding a new level between existing ones automatically renumbers all subsequent levels — no manual integer constants need updating.
+</Note>
+
+---
+
+## UnidadMedida
+
+Unit of measure for material quantities. Used by `materiales.unidad_medida` and `constancias_transmision.unidad_medida` (the latter copies from the material at issuance).
+
+```php
+enum UnidadMedida: string
+{
+    case Kilogramos    = 'kg';
+    case Toneladas     = 'ton';
+    case Litros        = 'litros';
+    case Unidades      = 'unidades';
+    case MetrosCubicos = 'm3';
+}
+```
+
+| Value | `etiqueta()` |
+|---|---|
+| `kg` | Kilogramos |
+| `ton` | Toneladas |
+| `litros` | Litros |
+| `unidades` | Unidades |
+| `m3` | Metros cúbicos |
+
+Static helpers: `valores()`, `etiquetas()`.
+
+---
+
+## AccionAuditoria
+
+Actions recorded in `audit_logs.accion`. Used by `AuditObserver` and the command execution listener. The column previously accepted any free text.
+
+```php
+enum AccionAuditoria: string
+{
+    case Alta             = 'created';
+    case Modificacion     = 'updated';
+    case Archivado        = 'archivado';
+    case Restauracion     = 'restaurado';
+    case Baja             = 'deleted';
+    case EjecutarComando  = 'ejecutar_comando';
+    case FinalizarComando = 'finalizar_comando';
+    case ErrorComando     = 'error_comando';
+    case Purga            = 'purge';
+}
+```
+
+Static helper: `valores()`.
+
+---
+
+## Supporting Enums
+
+The following enums are briefly documented here; they govern secondary subsystems.
+
+<Accordion title="TipoIncidente — Security incident types">
+
+Used by `incidentes_seguridad.tipo`. Seven values covering the observed incident categories:
+
+```php
+enum TipoIncidente: string
+{
+    case AccesoNoAutorizado     = 'acceso_no_autorizado';
+    case FugaInformacion        = 'fuga_informacion';
+    case PerdidaDatos           = 'perdida_datos';
+    case Malware                = 'malware';
+    case Phishing               = 'phishing';
+    case FalsificacionDocumento = 'falsificacion_documento';
+    case Otro                   = 'otro';
+}
+```
+
+Methods: `etiqueta()`, static `valores()`, `etiquetas()`, `etiquetaDe(?string)`.
+
+</Accordion>
+
+<Accordion title="OrigenComando — Command run origin">
+
+Used by `command_runs.origen`. Distinguishes CLI, panel-initiated, and scheduler-triggered executions:
+
+```php
+enum OrigenComando: string
+{
+    case Cli       = 'cli';
+    case Panel     = 'panel';
+    case Scheduler = 'scheduler';
+}
+```
+
+Static helper: `valores()`.
+
+</Accordion>
+
+<Accordion title="PrioridadNotificacion — Notification urgency">
+
+Three-level priority scale. Designed for clarity: `alta` requires action, `media` requires a decision (no deadline), `baja` is informational. Sorted using `peso()` (ascending = most urgent first) rather than alphabetically.
+
+```php
+enum PrioridadNotificacion: string
+{
+    case Alta  = 'alta';
+    case Media = 'media';
+    case Baja  = 'baja';
+}
+```
+
+| Value | `etiqueta()` | `color()` | `peso()` |
+|---|---|---|---|
+| `alta` | Alta | `danger` | 1 |
+| `media` | Media | `warning` | 2 |
+| `baja` | Informativa | `info` | 3 |
+
+The static `desde(?string)` method falls back to `Media` (not `Baja`) for unknown or legacy values — ensuring old notifications remain visible rather than sinking to the bottom of the inbox.
+
+</Accordion>
+
+<Accordion title="FamiliaDocumental — Environmental license document family">
+
+Used by `licencias_empresa.familia_documental`. Distinguishes the original declaration from subsequent audit resolutions:
+
+```php
+enum FamiliaDocumental: string
+{
+    case Declaracion  = 'declaracion';
+    case ResolucionAa = 'resolucion_aa';
+    case Otro         = 'otro';
+}
+```
+
+| Value | `etiqueta()` |
+|---|---|
+| `declaracion` | Declaración |
+| `resolucion_aa` | Resolución de auditoría |
+| `otro` | Otro |
+
+A PostgreSQL CHECK constraint on the column enforces this set; the values were previously free text in `LicenciaMetadataParser`.
+
+</Accordion>

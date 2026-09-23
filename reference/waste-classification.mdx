@@ -1,0 +1,263 @@
+---
+title: "Waste Classification: Paraguay's Regulatory Framework"
+sidebarTitle: "Waste Classification"
+description: "How ExcedentMarket maps Paraguay's Ley N.° 3956/2009 waste classes to its internal A/B/C codes, which class is commercializable, and why."
+---
+
+ExcedentMarket operates within a precise legal boundary defined by Paraguayan environmental law: it commercializes only **industrial non-hazardous surplus materials** generated in productive processes. Understanding which waste class a material belongs to is not a cosmetic tagging exercise — it determines whether the material can appear in the catalogue at all, which regulatory filing applies to its transfer, and what circular-economy metrics the platform reports to government. This page explains the regulatory basis, the system's three internal classes, the positive-criterion rule that enforces them, and the mechanisms that prevent misclassification.
+
+---
+
+## Regulatory Basis
+
+<CardGroup cols={2}>
+  <Card title="Ley N.° 3956/2009" icon="scale-balanced">
+    **Gestión Integral de Residuos Sólidos** — the primary waste management statute in Paraguay. Establishes the general framework for solid waste generation, handling, transport, and final disposal. Does **not** classify residues by letter codes.
+  </Card>
+  <Card title="Decreto N.° 7.391/2017" icon="file-lines">
+    **Regulatory decree** for Ley N.° 3956/2009. Article 8 establishes three waste groups. Article 16 mandates the transfer certificate that `ConstanciaTransmision` implements.
+  </Card>
+</CardGroup>
+
+<CardGroup cols={2}>
+  <Card title="Ley N.° 567/1995" icon="radiation">
+    **Residuos Peligrosos** — defines the hazardous waste regime. Materials under this law are excluded from ExcedentMarket's scope.
+  </Card>
+  <Card title="Convenio de Basilea" icon="globe">
+    Basel Convention on the Control of Transboundary Movements of Hazardous Wastes. Annex I materials are excluded from commercial exchange.
+  </Card>
+</CardGroup>
+
+<Note>
+  The letters **A**, **B**, and **C** are **internal system codes**, not regulatory designations. Decreto N.° 7.391/17 Art. 8 groups wastes into three unnamed sections (I, II, III) with sub-items. The system's codes are a mapping, not a quotation.
+</Note>
+
+---
+
+## The Three Internal Classes
+
+### Class A — Peligroso (Hazardous)
+
+Class A maps to Decreto N.° 7.391/17 Art. 8 group III: residues governed by **Ley N.° 567/95** and the **Convenio de Basilea Annex I**. These are hazardous wastes requiring specialized handling, transport, and disposal under a distinct regulatory chain.
+
+<Warning>
+  **Class A materials are completely excluded from ExcedentMarket.** They cannot be published, appear in the catalogue, or receive offers. The exclusion is enforced by both `LotePublicadoObserver` (at publication time) and `Material::scopeComercializable()` (at catalogue query time).
+</Warning>
+
+```php
+ClaseResiduo::A->esPeligroso();       // true
+ClaseResiduo::A->esComercializable(); // false
+ClaseResiduo::A->motivoExclusion();
+// "Es un residuo peligroso (Ley N.° 567/95) y queda fuera del alcance del sistema."
+```
+
+### Class B — Manejo Especial (Special Handling)
+
+Class B maps to Decreto N.° 7.391/17 Art. 8 group II, all incisos **except** inciso b. These are non-hazardous wastes with their own mandated valorization channels — they are **not hazardous**, but are excluded from this marketplace because they require a different circuit:
+
+<Accordion title="Examples of Class B materials (Art. 8 II)">
+
+- **II.a** — Residuos de establecimientos de salud (health-care waste)
+- **II.c** — Residuos agrícolas y de silvicultura
+- **II.d** — Residuos de la construcción civil (construction and demolition waste)
+- **II.e** — Neumáticos fuera de uso (end-of-life tires) — Art. 89.e, EPR channel
+- **II.f** — Residuos tecnológicos (WEEE / e-waste)
+- **II.h** — Otros residuos de manejo especial
+
+</Accordion>
+
+```php
+ClaseResiduo::B->esPeligroso();       // false
+ClaseResiduo::B->esComercializable(); // false
+ClaseResiduo::B->motivoExclusion();
+// "Es un residuo de manejo especial con circuito de valorización propio
+// (Decreto N.° 7.391/17, Art. 8.°, apartado II). Su canal es municipal
+// o de responsabilidad extendida, no este mercado."
+```
+
+<Info>
+  The separate `motivoExclusion()` message for Class B exists precisely so the system does **not** tell a company that their end-of-life tires are hazardous. A Class B exclusion is a routing decision ("wrong channel"), not a safety red flag.
+</Info>
+
+### Class C — Industrial No Peligroso (The Only Commercializable Class)
+
+Class C maps to **Decreto N.° 7.391/17 Art. 8, group II, inciso b**:
+
+> _"Los residuos industriales: aquellos generados en los procesos productivos e instalaciones industriales y comerciales, no asimilables a residuos sólidos urbanos y no incluidos en la Ley N.° 567/95."_
+
+This is the **entire universe of ExcedentMarket's catalogue**. Industrial surplus and by-products that are not urban solid waste and are not hazardous under Ley N.° 567/95 — plastics, metals, wood offcuts, packaging materials, textile scraps, and similar industrial residues.
+
+```php
+ClaseResiduo::C->esPeligroso();       // false
+ClaseResiduo::C->esComercializable(); // true
+ClaseResiduo::C->motivoExclusion();   // null
+```
+
+---
+
+## The Positive-Criterion Rule
+
+The most important architectural decision in the classification system is that `scopeComercializable()` is written in **positive terms**, not as a negation.
+
+<Tabs>
+  <Tab title="Current rule (positive)">
+
+```php
+// Material.php — scopeComercializable()
+public function scopeComercializable(Builder $query): Builder
+{
+    return $query
+        ->where('activo', true)
+        ->where('clase_residuo', ClaseResiduo::C->value); // must be 'C'
+}
+```
+
+**Effect:** An unclassified material (`clase_residuo = null`) does **not** enter the catalogue. It is invisible until a catalog administrator classifies it as Class C.
+
+  </Tab>
+  <Tab title="Former rule (negative — retired)">
+
+```php
+// Old logic (no longer in codebase):
+->where(function ($q) {
+    $q->where('clase_residuo', '!=', 'A')
+      ->orWhereNull('clase_residuo');
+})
+```
+
+**Problem:** This allowed any material that had never been reviewed into the catalogue by default. The system was selling what it had failed to classify. A NULL in `clase_residuo` evaluated to "not hazardous" — a false conclusion.
+
+  </Tab>
+</Tabs>
+
+<Warning>
+  **Never restore a negative-criterion rule.** In a system whose declared scope is a specific inciso of a regulatory decree, membership in that inciso must be **affirmed**, not inferred from the absence of a disqualifier. Unclassified materials are pending catalogue work, not approved stock.
+</Warning>
+
+---
+
+## Classification at the Lot Level
+
+A `LotePublicado` carries its **own** `clase_residuo` field in addition to inheriting the material's classification. The two are evaluated independently by `motivoNoPublicable()`:
+
+```php
+// LotePublicado.php — motivoNoPublicable()
+public function motivoNoPublicable(): ?string
+{
+    $claseLote = ClaseResiduo::desde($this->clase_residuo);
+
+    if ($claseLote !== null && ! $claseLote->esComercializable()) {
+        return 'El lote está declarado en la clase «'.$claseLote->etiqueta().'», que la plataforma '
+            . 'no comercializa. '.$claseLote->motivoExclusion();
+    }
+
+    $claseMaterial = ClaseResiduo::desde($this->material?->clase_residuo);
+
+    if ($claseMaterial !== null && ! $claseMaterial->esComercializable()) {
+        return 'El material del lote está en la clase «'.$claseMaterial->etiqueta().'», que la plataforma '
+            . 'no comercializa. '.$claseMaterial->motivoExclusion();
+    }
+
+    return null;
+}
+```
+
+The method takes **the stricter of the two declarations**: a Class-C material does not rescue a lot that has been declared Class A at the lot level, and vice versa. Both must resolve to commercializable — or the lot cannot be published.
+
+<Note>
+  This dual check closed a gap in the previous implementation: a generator could declare their lot as Class A (hazardous) but the catalogue only filtered by material class, so the lot entered the public marketplace regardless of what the generator had declared about their own material.
+</Note>
+
+---
+
+## The `Material::CLASE_PELIGROSA` Constant
+
+Both `Material` and `LotePublicado` define a `CLASE_PELIGROSA` constant. The two share the same value (`'A'`) and represent the same normative fact — the Class A exclusion rooted in Ley N.° 567/95.
+
+```php
+Material::CLASE_PELIGROSA;      // 'A'
+LotePublicado::CLASE_PELIGROSA; // 'A'
+
+// ClaseResiduo shares the same value via Material's constant
+ClaseResiduo::A->esPeligroso(); // true — same value as Material::CLASE_PELIGROSA
+```
+
+Having the constant in `Material` (where it originates) and referencing it from `LotePublicado` means there is a **single normative source**: if Paraguay ever revised the hazardous-waste statute to reclassify certain materials, the change would propagate from one constant.
+
+---
+
+## `ClaseResiduo::catalogo()` — UI Representation
+
+The `catalogo()` method returns all three classes in a format suitable for frontend dropdowns and classification forms. It **includes Class A** even though Class A is not commercializable:
+
+```php
+ClaseResiduo::catalogo();
+// Returns:
+// [
+//   ['clase' => 'A', 'etiqueta' => 'Peligroso',               'descripcion' => '...', 'peligroso' => true],
+//   ['clase' => 'B', 'etiqueta' => 'Manejo especial',          'descripcion' => '...', 'peligroso' => false],
+//   ['clase' => 'C', 'etiqueta' => 'Industrial no peligroso',  'descripcion' => '...', 'peligroso' => false],
+// ]
+```
+
+Class A is included because **historical lots** may already carry it, and the admin panel needs to display the correct label for those records. The `peligroso: true` flag lets the UI render a warning badge without hardcoding the class letter. The classification rule — not the absence of a label — is what excludes Class A from active commerce.
+
+---
+
+## Enforcement Points
+
+Classification is enforced at multiple layers. Each layer catches a different category of bypass attempt:
+
+<Steps>
+  <Step title="Material catalogue (query time)">
+    `Material::scopeComercializable()` — every marketplace query, lot-creation form, and catalogue dropdown passes through this scope. Unclassified and Class A/B materials never appear as options.
+  </Step>
+  <Step title="Lot publication (write time)">
+    `LotePublicado::motivoNoPublicable()` — evaluated by `LotePublicadoObserver` when the lot's state transitions to `publicado`. Checks both the lot's own `clase_residuo` and the material's. Returns a human-readable reason distinguishing Class A ("hazardous") from Class B ("wrong channel").
+  </Step>
+  <Step title="License guard (publishing actor)">
+    `Empresa::puedePublicarLotes()` — checks that the publishing company holds a valid environmental license (Ley N.° 294/93, Art. 7). Operated independently from classification — a company can be licensed but still try to publish a Class A lot.
+  </Step>
+  <Step title="Seeder bypass (explicit, documented)">
+    `LotePublicado::sinGuardaDeLicencia()` — wraps demo-data seeders that intentionally create lots in states the license guard would block (for UI testing). The bypass is named, visible via `grep`, and affects only the license check — the hazardous-class exclusion in the observer fires regardless.
+  </Step>
+</Steps>
+
+---
+
+## Reference: `ClaseResiduo` API Summary
+
+```php
+// All public API of ClaseResiduo in one view
+
+ClaseResiduo::A->etiqueta();        // 'Peligroso'
+ClaseResiduo::B->etiqueta();        // 'Manejo especial'
+ClaseResiduo::C->etiqueta();        // 'Industrial no peligroso'
+
+ClaseResiduo::A->descripcion();     // Full regulatory description
+ClaseResiduo::B->descripcion();
+ClaseResiduo::C->descripcion();
+
+ClaseResiduo::A->esPeligroso();     // true
+ClaseResiduo::B->esPeligroso();     // false
+ClaseResiduo::C->esPeligroso();     // false
+
+ClaseResiduo::A->esComercializable(); // false
+ClaseResiduo::B->esComercializable(); // false
+ClaseResiduo::C->esComercializable(); // true
+
+ClaseResiduo::A->motivoExclusion(); // non-null string
+ClaseResiduo::B->motivoExclusion(); // non-null string (different message)
+ClaseResiduo::C->motivoExclusion(); // null
+
+// Tolerant constructor (normalises to uppercase)
+ClaseResiduo::desde('c');           // ClaseResiduo::C
+ClaseResiduo::desde(null);          // null
+ClaseResiduo::desde('X');           // null (unknown value)
+
+// Backed values list (for migration ENUMs)
+ClaseResiduo::valores();            // ['A', 'B', 'C']
+
+// Full catalogue for UI, including Class A
+ClaseResiduo::catalogo();           // list of assoc arrays
+```

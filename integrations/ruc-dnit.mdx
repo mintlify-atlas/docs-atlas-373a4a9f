@@ -1,0 +1,208 @@
+---
+title: "RUC Validation Against Paraguay's DNIT Taxpayer Registry"
+sidebarTitle: "RUC / DNIT"
+description: "How ExcedentMarket imports the DNIT taxpayer padron locally and validates every company RUC against it — no external API required."
+---
+
+ExcedentMarket validates every registered company's RUC (Registro Único del Contribuyente) against the official registry published by Paraguay's **DNIT** (Dirección Nacional de Ingresos Tributarios). Crucially, the DNIT does not expose a query API — it publishes the complete taxpayer registry as a set of pipe-delimited ZIP archives on a monthly basis. The platform downloads those files, imports them into the `ruc_padron` table, and runs all RUC lookups against that local copy. This design means validations are instantaneous and survive any outage on the DNIT side; the tradeoff is that the local padron must be kept current.
+
+## Architecture Overview
+
+<CardGroup cols={2}>
+  <Card title="ImportarPadronDnitJob" icon="database">
+    Downloads all ten DNIT ZIP segments (one per leading RUC digit), parses each file line-by-line, and upserts records into `ruc_padron`.
+  </Card>
+  <Card title="RucDnitService" icon="magnifying-glass">
+    Queries the local `ruc_padron` table and writes each validation result to `ruc_validaciones`. Never touches the network.
+  </Card>
+  <Card title="ValidarRucEmpresasJob" icon="arrows-rotate">
+    Batch re-validation job automatically queued by `ImportarPadronDnitJob` two minutes after a full import completes.
+  </Card>
+  <Card title="RucObservadoNotification" icon="bell">
+    Notifies all admin users whenever the batch run finds companies with cancelled or not-found RUC status.
+  </Card>
+</CardGroup>
+
+---
+
+## Importing the Padron
+
+`ImportarPadronDnitJob` fetches the full DNIT registry. The DNIT splits the padron into **ten ZIP files**, one per initial digit (0–9) of the RUC. The job processes all segments by default; a specific segment can be targeted by passing its integer index to the constructor.
+
+```php
+// Dispatch a full import (all ten segments)
+ImportarPadronDnitJob::dispatch();
+
+// Dispatch a single-segment import (digit 3)
+ImportarPadronDnitJob::dispatch(3);
+```
+
+Key implementation details from the source:
+
+- **Timeout:** `$timeout = 1800` seconds — the ZIPs are large and parsing is line-by-line.
+- **Retries:** `$tries = 2`. A failure in one segment does **not** abort the rest; each segment is wrapped in its own `try/catch` so a partial import is always better than none.
+- **Encoding:** The padron has historically arrived in both UTF-8 and ISO-8859-1. The job auto-detects and converts before parsing so that Ñ and accented characters in `razon_social` are stored correctly.
+- **Upsert key:** `ruc_completo` (e.g. `1000000-3`). Duplicate `ruc_completo` values within a single batch are de-duplicated before the PostgreSQL upsert to avoid the "cannot affect row a second time" error.
+- **Auto-chain:** After a successful full import, `ValidarRucEmpresasJob` is dispatched with a 2-minute delay so it runs against the fresh data.
+
+### Padron line format
+
+Each file is pipe-delimited with a trailing pipe:
+
+```
+RUC|RAZON SOCIAL|DV|CODIGO_DNIT|ESTADO|
+1000000|CAÑETE GONZALEZ, JUANA DEL CARMEN|3|CAGJ761720E|ACTIVO|
+```
+
+`RucDnitService::parsearLineaPadron()` handles this format and normalises the `estado` field to one of `ACTIVO`, `CANCELADO`, `SUSPENSION TEMPORAL`, or `OTRO`.
+
+---
+
+## Validating a Company RUC
+
+`RucDnitService::validarEmpresa()` is the single entry point for RUC validation. It queries `ruc_padron`, writes a row to `ruc_validaciones`, and returns a typed array:
+
+```php
+/**
+ * Valida el RUC de una empresa y deja constancia en ruc_validaciones. El
+ * estado de la empresa se lee de esa ultima fila; no se copia.
+ *
+ * @return array{resultado: string, razon_social_dnit: ?string, codigo_dnit: ?string, coincide: ?bool}
+ */
+public function validarEmpresa(Empresa $empresa): array
+```
+
+The returned array shape:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `resultado` | `string` | One of the result values below |
+| `razon_social_dnit` | `?string` | Business name as it appears in the DNIT padron, or `null` if not found |
+| `codigo_dnit` | `?string` | DNIT internal identifier (e.g. `CAGJ761720E`), or `null` |
+| `coincide` | `?bool` | Whether the declared company name fuzzy-matches the padron name (≥70% of significant words), or `null` if the RUC was not found |
+
+### Validation Result Values
+
+The `ResultadoRuc` enum defines every possible outcome written to `ruc_validaciones.resultado`:
+
+```php
+enum ResultadoRuc: string
+{
+    case PadronVacio              = 'padron_vacio';
+    case PadronDesactualizado     = 'padron_desactualizado';
+    case FormatoInvalido          = 'formato_invalido';
+    case NoEncontrado             = 'no_encontrado';
+    case ValidoActivo             = 'valido_activo';
+    case ValidoSuspensionTemporal = 'valido_suspension_temporal';
+    case ValidoCancelado          = 'valido_cancelado';
+}
+```
+
+<Accordion title="What each result means">
+  <ResponseField name="valido_activo" type="string">
+    The RUC exists in the padron with status `ACTIVO`. This is the expected result for any active company.
+  </ResponseField>
+  <ResponseField name="valido_suspension_temporal" type="string">
+    The RUC exists but the taxpayer is under a temporary suspension with DNIT. The company may still operate but the status should be reviewed.
+  </ResponseField>
+  <ResponseField name="valido_cancelado" type="string">
+    The RUC exists but has been cancelled at DNIT. This is a negative result that blocks company approval.
+  </ResponseField>
+  <ResponseField name="no_encontrado" type="string">
+    The RUC was not found in the local padron at all. Either the RUC is incorrect or the company was never registered with DNIT.
+  </ResponseField>
+  <ResponseField name="formato_invalido" type="string">
+    The stored RUC string could not be parsed as a valid Paraguayan RUC. The check digit (dígito verificador) does not match using the official modulo-11 algorithm.
+  </ResponseField>
+  <ResponseField name="padron_vacio" type="string">
+    **Not a company state.** The `ruc_padron` table is empty — `ImportarPadronDnitJob` has never run successfully. The company remains `pendiente`; it is not penalised.
+  </ResponseField>
+  <ResponseField name="padron_desactualizado" type="string">
+    **Not a company state.** The most recent padron date is more than 35 days old (`RucPadron::DIAS_VIGENCIA = 35`). Validation proceeds anyway — a 40-day-old padron is better than nothing — but a warning is logged.
+  </ResponseField>
+</Accordion>
+
+<Note>
+  `padron_vacio` and `padron_desactualizado` are **infrastructure states**, not company states. `RucValidacion::RESULTADOS_SIN_EVALUAR` lists them explicitly, and `RucValidacion::estadoParaEmpresa()` maps both to `'pendiente'` so the company's profile is never marked invalid due to a missing import.
+</Note>
+
+---
+
+## Batch Re-validation
+
+`ValidarRucEmpresasJob` re-validates every company in the database after each full padron import. It processes companies in chunks of 200 using `chunkById` to avoid memory exhaustion, and it is tolerant of individual failures — a company with corrupt data does not stop the rest.
+
+```php
+class ValidarRucEmpresasJob implements ShouldQueue
+{
+    public int $timeout = 900;
+    public int $tries   = 2;
+
+    public function handle(RucDnitService $servicio): void
+    {
+        if (RucPadron::estaVacio()) {
+            Log::warning('ValidarRucEmpresasJob: padron vacio, se omite la revalidacion');
+            return;
+        }
+
+        Empresa::query()
+            ->orderBy('id')
+            ->chunkById(200, function ($empresas) use ($servicio): void {
+                foreach ($empresas as $empresa) {
+                    $servicio->validarEmpresa($empresa);
+                }
+            });
+    }
+}
+```
+
+After the run completes, if any companies came back with `valido_cancelado` or `no_encontrado`, a single `RucObservadoNotification` is dispatched to all users with the `admin` role. The notification only fires when there is something to act on — a monthly "zero observed companies" email trains administrators to ignore the alert.
+
+---
+
+## RUC Format Utilities
+
+`RucDnitService` also exposes standalone utilities that do not require the padron:
+
+<Accordion title="validarFormatoRuc(string $ruc): bool">
+  Validates the check digit using the **official Paraguayan modulo-11 algorithm**. Weights start at 2, increment to 11, then cycle back to 2. A remainder of 0 or 1 gives DV `0`; otherwise DV = `11 - remainder`. Accepts `"1000000-3"`, `"10000003"`, and `"1000000"` (no DV — only length is checked).
+</Accordion>
+
+<Accordion title="normalizar(string $ruc): ?string">
+  Converts any user-typed RUC to canonical form `NNNNNNNN-D`. Handles all three common input forms (`"80012345-6"`, `"800123456"`, `"80012345"`). Returns `null` if the input cannot be interpreted as a RUC. This is the method to call before storing a RUC; without normalisation the same company could be registered three times under three different representations, each producing a separate validation history.
+</Accordion>
+
+<Accordion title="calcularDv(string $ruc): string">
+  Returns the check digit for a given numeric RUC base. Verified against real padron samples: `1000000 → 3`, `1000060 → 7`, `1000080 → 1`.
+</Accordion>
+
+---
+
+## Database Tables
+
+<CardGroup cols={2}>
+  <Card title="ruc_padron" icon="table">
+    Local copy of the DNIT registry. Populated exclusively by `ImportarPadronDnitJob`. Key columns: `ruc`, `dv`, `ruc_completo`, `razon_social`, `codigo_dnit`, `estado`, `fecha_padron`. The `RucPadron` model exposes `estaVacio()`, `estaActualizado()`, and `diasDesdeActualizacion()` for health checks.
+  </Card>
+  <Card title="ruc_validaciones" icon="clock-rotate-left">
+    Full audit history — one row per validation attempt, never overwritten. Key columns: `empresa_id`, `resultado`, `ruc_validado`, `razon_social_dnit`, `codigo_dnit`, `coincide_razon_social`, `fecha_padron_usado`. The current effective state is always the most recent row.
+  </Card>
+</CardGroup>
+
+---
+
+## Scheduled Imports
+
+The padron import is meant to run once a month after the DNIT publishes a new file. Wire it in `routes/console.php` or `app/Console/Kernel.php`:
+
+```php
+Schedule::job(new ImportarPadronDnitJob())->monthly();
+```
+
+<Tip>
+  You can also trigger a single-segment import manually from Tinker for debugging: `ImportarPadronDnitJob::dispatchSync(0)` — this processes only the segment for RUCs starting with `0` and prints the log output inline.
+</Tip>
+
+<Warning>
+  Do not run `ValidarRucEmpresasJob` manually immediately after a partial import (single-segment). A partial padron will mark companies from the unimported segments as `no_encontrado`. The auto-dispatch in `ImportarPadronDnitJob` only fires after a **complete** (all-segment) run for this reason.
+</Warning>

@@ -1,0 +1,453 @@
+---
+title: "Service Classes: Business Logic Layer Reference"
+sidebarTitle: "Services"
+description: "Complete reference for ExcedentMarket's service layer: offer negotiation, CO2 tracking, traceability index, inventory, payments, and compliance."
+---
+
+ExcedentMarket's business logic lives entirely in the `App\Services` namespace — thin controllers delegate to these classes so that every rule is expressed once and applies identically across the web marketplace, the three Filament panels, and the scheduler. The services below are documented directly from source; every signature is real code.
+
+---
+
+## OfertaService
+
+Manages the full offer lifecycle under the optimistic-locking rules of spec 002. Every state transition locks the lot row inside a `DB::transaction` to prevent race conditions between concurrent buyers.
+
+```php
+// app/Services/OfertaService.php
+class OfertaService
+{
+    public const CONDICIONES_CAMBIARON =
+        'Las condiciones del lote cambiaron. Revisalas antes de ofertar.';
+
+    public function crearOferta(
+        LotePublicado $lote,
+        int $recicladorId,
+        int $precioUnitario,
+        array $condiciones,
+        CanalOferta $canal,
+    ): Oferta { ... }
+
+    public function comprarPrecioFijo(
+        LotePublicado $lote,
+        int $recicladorId,
+        array $condiciones,
+        CanalOferta $canal,
+    ): ?Contrato { ... }
+
+    public static function condicionesDe(LotePublicado $lote): array { ... }
+
+    public function aceptarOferta(Oferta $oferta): ?Contrato { ... }
+
+    public function retirarOferta(Oferta $oferta): bool { ... }
+
+    public function contraofertar(Oferta $oferta, int $precioUnitario): bool { ... }
+
+    public function rechazarContraoferta(Oferta $oferta): bool { ... }
+
+    public function motivoRechazoAdjudicacion(Oferta $oferta): ?string { ... }
+}
+```
+
+<Accordion title="crearOferta — optimistic locking detail">
+The method opens a `DB::transaction`, re-reads the lot with `lockForUpdate()`, and checks three guards before creating the offer:
+
+1. **State guard** — lot must be `publicado` or `en_negociacion`.
+2. **Condition guard** — the `$condiciones` array (quantity, reference price, pricing mode) must match the locked row exactly. A mismatch throws `OfertaRechazadaException` with key `condiciones` and the `CONDICIONES_CAMBIARON` message.
+3. **Self-offer guard** — `generador_id === recicladorId` is rejected.
+
+The only economic input is `$precioUnitario` (unit price in Guaraníes). Quantity is copied from the locked lot; the total is computed by the database. After creation, the lot moves to `en_negociacion` if it was `publicado`, and all `generador` users receive an `OfertaRecibidaNotification`.
+</Accordion>
+
+<Accordion title="aceptarOferta — adjudication and contract creation">
+Re-reads both the lot and the offer with `lockForUpdate()` to serialise concurrent acceptances. Accepts offers in states `pendiente` (seller accepts buyer's offer) or `contrarrestada` (buyer accepts seller's counter-offer). Creates a `Contrato` with the price frozen at `Oferta::precioUnitarioVigente()` and `tasa_comision_aplicada = Contrato::TASA_COMISION`. Returns `null` — without side-effects — if the lot is already adjudicated or the buyer's environmental licence has expired between offer and acceptance (RF-NEG-13).
+</Accordion>
+
+<Accordion title="contraofertar and rechazarContraoferta">
+`contraofertar(Oferta, int)` stores `precio_unitario_contraoferta` and moves the offer to `contrarrestada`. The lot stays `en_negociacion`. The buyer receives a `ContraofertaRecibidaNotification`.
+
+`rechazarContraoferta(Oferta)` ends in state `rechazada` (not `retirada`): the buyer is rejecting a seller's proposal, not withdrawing their own offer. Calls `devolverLoteSiQuedoSinOfertas()` which reverts the lot to `publicado` when no live offers (`pendiente` or `contrarrestada`) remain.
+</Accordion>
+
+---
+
+## CO2Service
+
+Calculates estimated CO₂ savings for the circular economy metrics. The core formula lives in `LotePublicado::co2EvitadoEstimado()` so that the web, panels, and this service always return the same number.
+
+```php
+// app/Services/CO2Service.php
+class CO2Service
+{
+    public function calcularAhorroPorLote(LotePublicado $lote): float { ... }
+
+    public function calcularAhorroPorEmpresa(Empresa $empresa): float { ... }
+
+    public function calcularAhorroTotal(): float { ... }
+
+    public function formatearToneladas(float $kg): string { ... }
+}
+```
+
+<ParamField body="calcularAhorroPorEmpresa" type="Empresa">
+  Sums `co2EvitadoEstimado()` across all lots from this `generador_id` that have a completed contract (`Contrato::completados()`). Eager-loads `material.factoresEmision`.
+</ParamField>
+
+<ParamField body="calcularAhorroTotal" type="void">
+  System-wide total across all lots with a completed contract. Used by the Admin dashboard widget and the SDG metrics table.
+</ParamField>
+
+<ParamField body="formatearToneladas" type="float $kg">
+  Delegates to `Unidades::toneladasFormateadas($kg)`. Returns a localised string such as `"1.25 ton"` for display in PDF documents and dashboard widgets.
+</ParamField>
+
+---
+
+## TrazabilidadService
+
+Computes the traceability index described in Table 8 of the thesis — the only measured variable that comes from the system itself rather than company declarations.
+
+```php
+// app/Services/TrazabilidadService.php
+class TrazabilidadService
+{
+    public const ESLABONES = [
+        1 => 'Alta',
+        2 => 'Publicacion',
+        3 => 'Negociacion',
+        4 => 'Adjudicacion',
+        5 => 'Pago',
+        6 => 'Documento',
+        7 => 'Destino',
+    ];
+
+    public const TOTAL_ESLABONES = 7;
+    public const ESLABON_ADJUDICACION = 4;
+    public const ESTADOS_EXCLUIDOS = ['borrador'];
+
+    public function evaluarLote(LotePublicado $lote): array { ... }
+
+    public function indiceGlobal(?int $anio = null, ?int $mes = null): array { ... }
+
+    public function detallePorLote(?int $anio = null, ?int $mes = null): Collection { ... }
+}
+```
+
+<Note>
+  **Two denominators, not one.** `indiceGlobal()` reports both a global proportion (all non-draft lots) and a restricted proportion (adjudicated lots only). The global index is dominated by the commercial funnel; the restricted index answers the real question: does the system complete the documentary chain when a transaction actually occurs?
+</Note>
+
+<ResponseField name="indiceGlobal return shape" type="array">
+  ```php
+  [
+      'lotes_evaluados'        => int,
+      'completos'              => int,
+      'proporcion'             => float,   // % of all lots completing all 7 links
+      'adjudicados'            => int,
+      'proporcion_adjudicados' => float,   // % restricted to adjudicated lots
+      'indice_promedio'        => float,
+      'faltantes_por_eslabon'  => array<int, int>,
+      'eslabones'              => array<int, string>,
+      'desde'                  => string|null,
+      'hasta'                  => string|null,
+  ]
+  ```
+</ResponseField>
+
+**Warning on modifying `ESLABONES`:** The constant is used in three places — `evaluarLote()`, `indiceGlobal()`, and `detallePorLote()`. Any change to the seven checkpoints invalidates all measurements reported in Chapter V of the thesis and requires a full re-run.
+
+---
+
+## InventarioService
+
+Implements double-entry inventory tracking (Option C of the plan). When a contract is formalised, the material moves out of the generator's warehouse (egress) and into the recycler's warehouse (ingress), closing the ISO 59004 traceability chain from source to destination.
+
+```php
+// app/Services/InventarioService.php
+class InventarioService
+{
+    public function registrarPorContrato(Contrato $contrato): void { ... }
+
+    public function almacenPrincipal(Empresa $empresa): Almacen { ... }
+}
+```
+
+<Accordion title="registrarPorContrato — idempotency and double entry">
+Idempotent: skips re-registration if the contract already has `MovimientoStock` records, so that the `activo → completado` observer transition cannot duplicate entries.
+
+The egress warehouse is taken from `$lote->almacen` (set at publication time). The fallback `almacenPrincipal()` is preserved for lots created before the `almacen_id` column existed. The quantity is read from `$contrato->cantidad` (frozen at adjudication), not from the current lot — so post-adjudication lot edits cannot alter the inventory entry.
+
+`ajustarStock()` uses `lockForUpdate()` on the `Stock` row to serialise two concurrent contracts moving the same material/warehouse pair. Egress never drives stock below zero.
+</Accordion>
+
+---
+
+## RetiroService
+
+Manages the three-act physical handover circuit — the part of the system that closes the traceability chain between payment and final disposal.
+
+```php
+// app/Services/RetiroService.php
+class RetiroService
+{
+    public function __construct(
+        private readonly ConstanciaService $constancias,
+    ) {}
+
+    public function registrarEntrega(
+        ConstanciaTransmision $constancia,
+        string $numeroFactura,
+        ?string $numeroNotaRemision = null,
+    ): bool { ... }
+
+    public function confirmarRetiro(ConstanciaTransmision $constancia): bool { ... }
+
+    public function confirmarRecepcion(ConstanciaTransmision $constancia): bool { ... }
+}
+```
+
+<Steps>
+  <Step title="Entrega (vendedor)">
+    The **generator** calls `registrarEntrega()` with the invoice number (`001-001-0000001` format enforced) and an optional remittance note number. The destination is frozen from the recycler company record at this point.
+  </Step>
+  <Step title="Retiro (comprador)">
+    The **recycler** calls `confirmarRetiro()`, acknowledging that they collected the load. The constancia moves to transit state and the generator receives a notification.
+  </Step>
+  <Step title="Recepción (comprador)">
+    The **recycler** calls `confirmarRecepcion()`, which also calls `completarContrato()` inside the same transaction — transitioning the contract from `activo` to `completado`. The PDF is re-rendered with `regenerarPdfConfirmada()` to stamp the final conformity.
+  </Step>
+</Steps>
+
+<Warning>
+  PDF re-emission happens **outside** the transaction after each act. If it fails, the act is already recorded and the PDF regenerates at the next step or from the Admin panel. Do not move `reemitir()` inside the transaction — it would hold the row lock during a full Dompdf render.
+</Warning>
+
+---
+
+## RegistroService
+
+Creates a new `User` + `Empresa` pair in a single transaction and seeds the privacy consent record required by Ley N.° 7.593/2025.
+
+```php
+// app/Services/RegistroService.php
+class RegistroService
+{
+    public function registrarGeneradorOReciclador(array $validated): void
+    {
+        $politicaVersion = $this->versionDePoliticaVigente();
+
+        DB::transaction(function () use ($validated, $politicaVersion): void {
+            $empresa = Empresa::create([...]);
+            $empresa->categoriasInteres()->sync($validated['categorias_interes'] ?? []);
+            $empresa->sincronizarValorizacionesInteres($validated['valorizaciones_interes'] ?? []);
+
+            $user = User::create([
+                ...
+                'privacy_accepted_at'    => now(),
+                'privacy_policy_version' => $politicaVersion,
+            ]);
+
+            $user->assignRole($validated['tipo']);
+        });
+    }
+}
+```
+
+<Warning>
+  `versionDePoliticaVigente()` throws `\RuntimeException` if no active `PoliticaPrivacidad` row exists. There is **no fallback** to a literal version string — sealing consent against a non-existent policy version violates the foreign key constraint and rolls back the entire registration. Always run `php artisan db:seed --class=PoliticaPrivacidadSeeder` before the first registration.
+</Warning>
+
+---
+
+## ConstanciaService
+
+Emits the `ConstanciaTransmision` PDF with a sequential serial number (`CT-YYYY-NNNNN`), a SHA-256 hash, and a ULID verification code. It is the **only** document that certifies material handover — a previous `manifiesto` document from `DocumentoService` was eliminated to avoid two documents with two codes for the same legal act.
+
+```php
+// app/Services/ConstanciaService.php
+class ConstanciaService
+{
+    public function generarDesdeContrato(
+        Contrato $contrato,
+        array $datos = [],
+    ): ConstanciaTransmision { ... }
+
+    public function regenerarPdf(
+        ConstanciaTransmision $constancia,
+        bool $forzar = false,
+    ): bool { ... }
+
+    public function regenerarPdfConfirmada(
+        ConstanciaTransmision $constancia,
+    ): bool { ... }
+}
+```
+
+`regenerarPdf()` refuses to re-emit a constancia with `estado = confirmada` unless `$forzar = true`, because a confirmed constancia is legal evidence. `regenerarPdfConfirmada()` passes `forzar: true` precisely for the final render that must stamp the reception conformity.
+
+The `registrarEnElLegajo()` private method uses `DocumentoCertificacion::updateOrCreate()` — each re-emission overwrites the same row rather than accumulating one row per render.
+
+---
+
+## DocumentoService
+
+Decides **which** contract documents are emitted and **when** — the `EmisorDocumentos` class handles the shared render/hash/write ritual.
+
+```php
+// app/Services/DocumentoService.php
+class DocumentoService
+{
+    public function generarContrato(Contrato $contrato): DocumentoCertificacion { ... }
+    public function generarCertificadoAmbiental(Contrato $contrato): DocumentoCertificacion { ... }
+    public function generarComprobanteComision(Contrato $contrato): DocumentoCertificacion { ... }
+    public function generarReciboMaterial(Contrato $contrato, ?Pago $pago = null): DocumentoCertificacion { ... }
+    public function generarConstanciaDePago(Contrato $contrato, ?Pago $pago = null): DocumentoCertificacion { ... }
+    public function emitirDocumentosDelCobro(Contrato $contrato, ?Pago $pago = null): void { ... }
+    public function descargar(DocumentoCertificacion $documento): string { ... }
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="On adjudication" icon="file-contract">
+    `generarContrato()` — the agreement, emitted before payment so the buyer has written backing before paying. No serial of its own; identified by the contract number.
+  </Card>
+  <Card title="On activation (post-payment)" icon="leaf">
+    `generarCertificadoAmbiental()` and `generarComprobanteComision()` — via `GenerarDocumentosContratoJob`. The commission voucher is addressed to the **generator** (who bears the deduction), not the recycler.
+  </Card>
+  <Card title="On payment confirmation" icon="receipt">
+    `emitirDocumentosDelCobro()` — emits `generarReciboMaterial()` (for the generator) and `generarConstanciaDePago()` (for the recycler). Both use `Correlativo::proximo()` for their serial numbers (`RM-…` and `CP-…`).
+  </Card>
+  <Card title="Idempotent by type" icon="shield-check">
+    Each method checks `documentos()->where('tipo', …)->exists()` before emitting — not whether any document exists — so all six document types can coexist on the same contract.
+  </Card>
+</CardGroup>
+
+### EmisorDocumentos
+
+The low-level PDF emitter shared by both `DocumentoService` and `ConstanciaService`:
+
+```php
+// app/Services/EmisorDocumentos.php
+final class EmisorDocumentos
+{
+    public function emitir(
+        string $vista,
+        array $datos,
+        string|callable $ruta,
+        ?string $codigo = null,
+        array $opcionesPdf = [],
+    ): DocumentoEmitido { ... }
+
+    public function leer(string $ruta): string { ... }
+    public function existe(string $ruta): bool { ... }
+    public static function nuevoCodigo(): string { ... }  // lowercase ULID
+}
+```
+
+`$ruta` accepts a callable `fn(string $hash): string` for documents that embed the SHA-256 in their filename. The verification code is generated before render (it appears inside the PDF QR); the hash is computed after render (it is the fingerprint of the actual file). `Storage::disk()->put()` return value is checked — a `false` response throws rather than silently registering a document with no backing file.
+
+---
+
+## UmbralGeneradorService
+
+Monitors the annual waste volume threshold defined in Decreto N.° 7.391/17 (10,000 kg/year = gran generador boundary).
+
+```php
+// app/Services/UmbralGeneradorService.php
+class UmbralGeneradorService
+{
+    public const UMBRAL_KG_ANUAL   = 10_000;
+    public const PORCENTAJE_ALERTA = 0.80;
+
+    public function acumuladoDoceMeses(
+        Empresa $empresa,
+        ?CarbonInterface $hasta = null,
+    ): array { ... }
+
+    public function empresasEnAlerta(
+        ?CarbonInterface $hasta = null,
+    ): Collection { ... }
+
+    public function umbralToneladas(): float { ... }
+}
+```
+
+<ResponseField name="acumuladoDoceMeses return shape" type="array">
+  ```php
+  [
+      'kg'                       => float,
+      'toneladas'                => float,
+      'porcentaje'               => float,
+      'desde'                    => string,   // d/m/Y
+      'hasta'                    => string,   // d/m/Y
+      'excluidos_sin_conversion' => int,
+      'unidades_excluidas'       => list<string>,
+      'supera_alerta'            => bool,
+  ]
+  ```
+</ResponseField>
+
+Uses a **rolling 12-month window**, not a calendar year, because a company moving nine tonnes between October and March is as close to the threshold as one that does so between January and December.
+
+Only `kg` and `ton` units have an exact weight equivalent (`FACTORES_KG`). Litres, units, and m³ are excluded and reported in `excluidos_sin_conversion` — inventing a density for a legal obligation would produce a false figure.
+
+---
+
+## DeteccionIncidentes
+
+Automatically opens security incidents as required by Ley N.° 7.593/2025, so the breach register does not depend solely on manual admin entry.
+
+```php
+// app/Services/DeteccionIncidentes.php
+class DeteccionIncidentes
+{
+    private const UMBRAL_LOGIN_FALLIDO = 5;
+    private const VENTANA_MINUTOS      = 15;
+    private const SILENCIO_HORAS       = 1;
+
+    public function loginFallido(?string $email, string $ip): void { ... }
+}
+```
+
+`loginFallido()` increments a Cache counter keyed by IP. When the counter reaches `UMBRAL_LOGIN_FALLIDO` within `VENTANA_MINUTOS`, it creates an `IncidenteSeguridad` record and notifies all admin users via `IncidenteSeguridadDetectadoNotification`. A silence key (`incidente_login:{ip}`) suppresses duplicate incidents from the same IP for `SILENCIO_HORAS`. All notification failures are caught and logged so that a mail delivery error never surfaces as an authentication error for the person at the login screen.
+
+---
+
+## PaymentGatewayManager
+
+Registry and dispatcher for all payment gateway implementations. Configured at boot time with an iterable of `PaymentGateway` instances.
+
+```php
+// app/Services/PaymentGatewayManager.php
+class PaymentGatewayManager
+{
+    public array $config = [
+        'names'   => ['pagopar', 'dlocalgo', 'simulado'],
+        'default' => 'dlocalgo',
+    ];
+
+    public function __construct(iterable $gateways = []) { ... }
+
+    public function add(PaymentGateway $gateway): self { ... }
+    public function get(string $nombre): ?PaymentGateway { ... }
+    public function all(): Collection { ... }
+    public function disponibles(): Collection { ... }
+    public function opcionesParaUsuario(): array { ... }
+    public function porDefecto(): ?PaymentGateway { ... }
+    public function iniciar(string $nombre, Contrato $contrato, User $comprador): array { ... }
+    public function urlCheckout(string $nombre, string $paymentId): string { ... }
+    public function procesarWebhook(string $nombre, array $payload, string $firma): array { ... }
+    public function confirmarSimulado(string $nombre, string $paymentId, bool $pagado, string $formaPago): Pago { ... }
+    public function consultarEstado(string $nombre, string $paymentId): array { ... }
+    public function detectarPorPaymentId(string $paymentId): ?PaymentGateway { ... }
+}
+```
+
+<Accordion title="disponibles() and porDefecto()">
+`disponibles()` filters registered gateways by `PaymentGateway::disponible()` — which each implementation determines based on env vars (`PAGOPAR_TOKEN`, `DLOCALGO_X_LOGIN`, etc.).
+
+`porDefecto()` returns the first non-`simulado` available gateway, falling back to `simulado`. This means the sandbox always has a working gateway even without production credentials.
+</Accordion>
+
+<Accordion title="detectarPorPaymentId()">
+Looks up a `Pago` row by `dlocalgo_payment_id` or `pagopar_hash` to identify which gateway owns a webhook payload. Used by `PaymentController::webhook()` when the gateway name is not in the request.
+</Accordion>

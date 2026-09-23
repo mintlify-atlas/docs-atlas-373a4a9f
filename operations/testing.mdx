@@ -1,0 +1,207 @@
+---
+title: "Testing ExcedentMarket: Suite, Real Motor, and Quality Tools"
+sidebarTitle: "Testing"
+description: "How to run ExcedentMarket's Pest test suite, the real-engine integration script, and the full set of static-analysis and linting quality tools."
+---
+
+ExcedentMarket has a two-layer testing strategy: a fast in-container Pest suite that covers application logic, and a separate shell script that verifies everything the suite structurally cannot see — PostgreSQL-specific constraints, Apache file serving, and database isolation. Running both is the complete verification baseline before any deployment.
+
+## Running the Test Suite
+
+The suite runs **inside the container**, not on the host machine. The `vendor/` directory and compiled assets live inside the Docker image and do not exist in `web/` on the host filesystem — running tests from the host always produces a false-negative failure.
+
+```bash
+docker compose exec web php artisan test --parallel
+```
+
+The `--parallel` flag is the default in the `composer test` script (which also clears the config cache first):
+
+```bash
+docker compose exec web composer test
+```
+
+<Note>
+  Limit the number of parallel processes when running Docker Desktop on a constrained machine. Pest with many processes can exhaust Docker Desktop's memory allocation mid-run, dropping the suite with no result:
+
+  ```bash
+  docker compose exec web php artisan test --parallel --processes=4
+  ```
+</Note>
+
+## Test Framework
+
+The suite uses **Pest v4** (the test runner and assertion layer) on top of **PHPUnit 12** (the execution engine). Test files live in `tests/Unit/` and `tests/Feature/`.
+
+```json
+// composer.json (dev dependencies)
+"pestphp/pest": "^4.7",
+"pestphp/pest-plugin-laravel": "^4.1",
+"phpunit/phpunit": "^12.5.12"
+```
+
+## Test Database: SQLite In-Memory
+
+The suite does **not** run against the PostgreSQL development database. `phpunit.xml` overrides every database variable with SQLite in-memory:
+
+```xml
+<!-- phpunit.xml -->
+<env name="DB_CONNECTION" value="sqlite" force="true"/>
+<env name="DB_DATABASE" value=":memory:" force="true"/>
+<env name="DB_URL" value="" force="true"/>
+<env name="DB_HOST" value="" force="true"/>
+```
+
+The `force="true"` attribute is critical. Without it, `<env>` only sets a variable if it does not already exist in the environment. Docker Compose injects the full `web/.env` into the container, so `DB_CONNECTION=pgsql` is already present — without `force`, the override is silently ignored and the suite runs against the development database, wiping it with every `RefreshDatabase` call. This has happened before.
+
+### What SQLite Cannot Test
+
+<Warning>
+  SQLite is an intentional trade-off: it makes the suite fast and isolated, but it cannot exercise several behaviors that PostgreSQL enforces.
+</Warning>
+
+The `verificar_motor_real.sh` script exists precisely to cover these gaps:
+
+<CardGroup cols={2}>
+  <Card title="PostgreSQL CHECK constraints" icon="shield-check">
+    SQLite ignores `CHECK` constraints entirely. Constraints like `ofertas_precio_positivo`, `lotes_publicados_cantidad_positiva`, `contratos_tasa_comision_rango`, and `licencias_empresa_proxima_auditoria_derivada` are all silently bypassed in the suite.
+  </Card>
+  <Card title="Generated columns" icon="calculator">
+    PostgreSQL enforces that `GENERATED ALWAYS AS` columns cannot be written. SQLite allows writing any column. The suite cannot verify that `monto_ofertado`, `monto_material`, and `comision_plataforma` are truly immutable.
+  </Card>
+  <Card title="JSONB column type" icon="code">
+    The `notifications.data` column must be `jsonb` (not `text`) so that Filament's bell query (`data->>'format' = 'filament'`) works. SQLite has no native JSON type; the suite would never detect a migration that creates `data` as plain `text`.
+  </Card>
+  <Card title="Case-sensitive LIKE" icon="magnifying-glass">
+    SQLite's `LIKE` ignores case by default. PostgreSQL's `LIKE` is case-sensitive. The catalogue search uses `ILIKE` to fix this; the suite cannot detect a regression to `LIKE`.
+  </Card>
+</CardGroup>
+
+Additional gaps: Apache file-serving behavior for `private_storage` files, the end-to-end Pagopar payment webhook flow, and floating-point rounding in PostgreSQL `NUMERIC` columns versus SQLite `REAL`.
+
+## Integration Script: `verificar_motor_real.sh`
+
+For everything the suite cannot test, run the integration script against the **live running system** with containers up and the database seeded:
+
+```bash
+bash scripts/verificar_motor_real.sh
+```
+
+The script exits with **code 1** if any check fails. It prints `[OK]`, `[FALLA]`, or `[INFO]` for each check and a final tally.
+
+<Steps>
+  <Step title="Preconditions">
+    Verifies that the `database` and `web` containers are running and that the key tables are seeded. Exits with code 2 (not 1) if preconditions fail, so CI can distinguish "script ran and found failures" from "script couldn't run at all".
+  </Step>
+  <Step title="PostgreSQL constraints">
+    Tests each named `CHECK` constraint and foreign key by running a violating DML statement inside a `BEGIN … ROLLBACK` transaction. Checks that the rejection names the *expected* constraint — not just any error — so a removed or renamed constraint produces a clear failure rather than a false pass from a different error.
+  </Step>
+  <Step title="Generated columns">
+    Confirms that `UPDATE` statements targeting generated columns (`monto_ofertado`, `monto_material`, `comision_plataforma`) are rejected with PostgreSQL's "can only be updated to DEFAULT" message.
+  </Step>
+  <Step title="Decimal rounding">
+    Inserts an offer with non-integer quantity (12.5 units × 83,333 Gs.) and checks that the generated total is exactly 1,041,663 Gs. (rounded to the nearest guaraní). SQLite uses IEEE 754 `REAL` and can produce a different result for the same arithmetic.
+  </Step>
+  <Step title="JSONB type and bell query">
+    Reads `information_schema.columns` to confirm `notifications.data` is `json` or `jsonb`, then executes Filament's exact bell query to confirm it returns a numeric result.
+  </Step>
+  <Step title="Case-insensitive search">
+    Queries the live catalogue endpoint for both `?search=Cobre` and `?search=cobre` and confirms the result counts match.
+  </Step>
+  <Step title="Encryption in the real database">
+    Reads `empresas.telefono` raw (bypassing Eloquent's transparent decryption) and confirms that no value is stored in plaintext. Encrypted values start with `eyJpdiI6`.
+  </Step>
+  <Step title="Apache private file protection">
+    Confirms that ARCO export files stored in `storage/app/private` cannot be downloaded via the `/storage/` URL that Apache serves directly (bypassing Laravel's authenticated download route).
+  </Step>
+  <Step title="Suite database isolation">
+    Counts `lotes_publicados` before and after running the full suite. If the count changes, the suite is touching the development database instead of its SQLite in-memory one.
+  </Step>
+</Steps>
+
+<Tip>
+  Run `verificar_motor_real.sh` after any migration that adds or modifies a `CHECK` constraint, foreign key, or generated column. The constraint name in the script must match the name in the migration — rename one without updating the other and the check silently passes on the wrong constraint.
+</Tip>
+
+## Quality Tools
+
+All quality tools run inside the container:
+
+<Tabs>
+  <Tab title="Linting (Pint)">
+    ```bash
+    # Dry-run: shows what would change, makes no edits
+    docker compose exec web composer lint
+
+    # Auto-fix: applies all style corrections in place
+    docker compose exec web composer lint:fix
+    ```
+
+    Laravel Pint enforces PSR-12 style plus project-specific rules. The dry-run is suitable for CI; auto-fix is for local development.
+  </Tab>
+  <Tab title="Static Analysis (PHPStan)">
+    ```bash
+    docker compose exec web composer analyse
+    ```
+
+    Runs Larastan (PHPStan with Laravel-aware stubs) with a 512 MB memory limit. Larastan understands Eloquent model relationships, request objects, and Facades, so it catches type errors that plain PHPStan would miss or falsely flag.
+
+    ```json
+    // composer.json
+    "analyse": "php vendor/bin/phpstan analyse --memory-limit=512M"
+    ```
+  </Tab>
+  <Tab title="PHP Syntax Check">
+    ```bash
+    docker compose exec web sh -c 'find app -name "*.php" -exec php -l {} \;' | grep -v "No syntax errors"
+    ```
+
+    Runs `php -l` on every file in `app/`. Any output means a syntax error exists. Useful as a fast pre-commit check before running the full suite.
+  </Tab>
+  <Tab title="Full Quality Gate">
+    ```bash
+    # Lint (dry-run) + PHPStan in one command
+    docker compose exec web composer quality
+    ```
+
+    The `quality` Composer script chains `lint` and `analyse`:
+
+    ```json
+    // composer.json
+    "quality": [
+        "@lint",
+        "@analyse"
+    ]
+    ```
+  </Tab>
+</Tabs>
+
+## `phpunit.xml` Reference
+
+The test configuration file enforces several overrides that prevent common environmental leakage:
+
+| Variable | Test value | Why forced |
+|---|---|---|
+| `APP_ENV` | `testing` | Activates test-mode guards in `TestCase.php`. |
+| `APP_URL` | `http://localhost` | Docker Compose injects a URL with a port sub-path; that breaks Livewire's test endpoint. |
+| `DB_CONNECTION` | `sqlite` | See above — must be forced or Compose's `pgsql` value wins. |
+| `DB_DATABASE` | `:memory:` | In-memory SQLite; wiped after each test. |
+| `MAIL_MAILER` | `array` | Prevents any real email dispatch. Use `Mail::assertSent()` to check email in tests. |
+| `QUEUE_CONNECTION` | `sync` | Jobs run synchronously in tests — no need for a worker. |
+| `SESSION_DRIVER` | `array` | In-memory sessions; no database writes. |
+| `PAGOPAR_MODO` | `simulado` | Prevents outbound Pagopar API calls even if real keys are present in `web/.env`. |
+| `PAGOPAR_PUBLIC_KEY` | *(empty)* | Cleared to ensure no accidental staging API calls. |
+| `PAGOPAR_PRIVATE_KEY` | *(empty)* | Cleared for the same reason. |
+
+## What the Suite Cannot Cover
+
+As a summary, these scenarios require `verificar_motor_real.sh` or manual verification and cannot be addressed in the Pest suite:
+
+- PostgreSQL `CHECK` constraint enforcement on any column
+- Generated columns refusing direct writes
+- `ILIKE` vs `LIKE` case-sensitivity in catalogue search
+- `notifications.data` being `jsonb` (not `text`)
+- Decimal rounding in `NUMERIC` columns
+- Apache directly serving files under `/storage` without passing through Laravel
+- ARCO export files not being accessible via the public storage URL
+- End-to-end payment gateway webhook callbacks from Pagopar
+- The suite not touching the development database (isolation check)

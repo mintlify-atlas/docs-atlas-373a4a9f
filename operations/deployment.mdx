@@ -1,0 +1,195 @@
+---
+title: "Deploy ExcedentMarket with Docker Compose"
+sidebarTitle: "Deployment"
+description: "Step-by-step guide to building and deploying ExcedentMarket with Docker Compose, covering build targets, volumes, ports, and production hardening."
+---
+
+ExcedentMarket ships as a single Docker Compose project that handles the entire lifecycle — from generating `APP_KEY` and running migrations on first boot to publishing Filament assets and starting the Vite HMR server in development. A single command is enough to go from a clean clone to a running application; no manual `.env` copying, key generation, or seeding is required.
+
+## Build Targets
+
+The `Dockerfile` defines two named targets that share the same PHP base image and extension set, so the PHP version and loaded extensions are **identical** in both environments.
+
+<CardGroup cols={2}>
+  <Card title="dev (default)" icon="code">
+    Includes Node.js binaries, npm dev dependencies, and OPcache configured to revalidate file timestamps on every request. The pre-built Vite assets are also embedded as a fallback if the HMR server hasn't started yet.
+  </Card>
+  <Card title="prod" icon="rocket">
+    Strips Node, dev Composer dependencies, and freezes OPcache (`validate_timestamps = 0`). The classmap autoloader uses `--classmap-authoritative` so filesystem checks are skipped on every autoload.
+  </Card>
+</CardGroup>
+
+Set `BUILD_TARGET` in the root `.env` to control which target is built:
+
+```bash
+# .env (root)
+BUILD_TARGET=prod
+APP_ENV=production
+```
+
+Then build and start:
+
+```bash
+docker compose up -d --build
+```
+
+<Warning>
+  In production the entrypoint **refuses** to auto-generate `APP_KEY`. If `APP_ENV=production` and `APP_KEY` is empty, the container exits immediately with an error. You must supply the key explicitly in the deployment environment before starting.
+</Warning>
+
+## APP_KEY Persistence
+
+In non-production environments, the entrypoint generates a key on first boot and writes it to `storage/app/state/app_key` inside the `app_state` volume. On every subsequent start, the key is loaded from that file instead of being regenerated. This means:
+
+- Sessions and encrypted data survive container rebuilds and image updates.
+- `docker compose down -v` destroys the volume and forces a new key on the next start, invalidating all existing sessions.
+
+In production, set `APP_KEY` as an environment variable in your deployment platform and never rely on auto-generation.
+
+## `MANTENER_DATOS` Flag
+
+```bash
+# web/.env
+MANTENER_DATOS=true
+```
+
+When set to `true`, the `App\Support\PoliticaDeBorrado` policy blocks **all** destructive migration operations (`migrate:fresh`, demo reseeding, load-test purges) even when `APP_ENV=local`. This is the correct setting for a local database that contains demo or real data you don't want to lose accidentally.
+
+<Note>
+  `MANTENER_DATOS` is independent of `APP_ENV`. Destructive operations are already blocked in `staging` and `production` regardless of this flag; the flag only adds protection in `local` and `development`.
+</Note>
+
+## Startup Sequence
+
+The `entrypoint.sh` runs this ordered sequence inside the container on every `up`:
+
+<Steps>
+  <Step title="Prepare filesystem">
+    Creates required storage directories (`storage/app/public`, `storage/app/private`, `storage/app/state`, framework cache subdirs, `bootstrap/cache`) and ensures `laravel.log` exists and is writable by `www-data` **before** any Artisan command runs. If the log were root-owned, every exception would be masked by a logging failure.
+  </Step>
+  <Step title="Create .env if absent">
+    Copies `web/.env.example` → `web/.env` on a clean clone. This is what makes `docker compose up` work without any manual steps.
+  </Step>
+  <Step title="Resolve APP_KEY">
+    Loads the key from the `app_state` volume or generates it (non-production only). Aborts if `APP_ENV=production` and no key is set.
+  </Step>
+  <Step title="Wait for PostgreSQL">
+    Polls `pg_isready` every 2 seconds for up to 60 seconds before proceeding.
+  </Step>
+  <Step title="Run migrations">
+    Executes `php artisan migrate --force`. The `queue` and `scheduler` services skip this step entirely — only the `web` service owns database initialization.
+  </Step>
+  <Step title="Seed (first install only)">
+    Detects a fresh database by counting rows in `users`. If zero: runs `shield:generate` first (defines all permissions), then `permission:cache-reset` (clears Spatie's permission cache), then `db:seed`. Reversing this order produces a `duplicate key … role_has_permissions` error.
+  </Step>
+  <Step title="Publish assets and clear caches">
+    Runs `filament:assets`, clears all caches (config, route, view, event, icons, Filament components), then re-caches everything in production.
+  </Step>
+  <Step title="Start Vite HMR (non-production only)">
+    Installs npm dependencies if missing and starts the Vite dev server on `0.0.0.0:${VITE_PORT}`. If `APP_URL` is `https://`, the dev server is skipped (mixed content) and the pre-built assets in `public/build` are served instead.
+  </Step>
+  <Step title="Start Apache">
+    Hands off to `apache2-foreground` as the main process.
+  </Step>
+</Steps>
+
+## Volume Overview
+
+| Volume | Mount path | Purpose |
+|---|---|---|
+| `cv_storage` | `storage/app/public` | Public media: lot photos, certificates. Served via the `/storage` symlink. |
+| `private_storage` | `storage/app/private` | ARCO export files — never HTTP-accessible. Shared by `web`, `queue`, and `scheduler`. |
+| `app_state` | `storage/app/state` | Persisted `APP_KEY`. Shared by `web`, `queue`, and `scheduler` so all containers decrypt the same payloads. |
+| `pgdata` | `/var/lib/postgresql/data` | PostgreSQL data directory. |
+| `node_modules` | `node_modules/` | npm packages, populated at runtime by the entrypoint in `dev` mode. |
+
+<Warning>
+  **Do not bind-mount application code in development.** The code lives inside the image. Use `docker compose watch` to sync file changes — it copies only what changed, without a full rebuild. Bind mounts bypass OPcache invalidation and can cause subtle runtime mismatches.
+</Warning>
+
+## Port Mappings
+
+| Variable | Default | Service | Notes |
+|---|---|---|---|
+| `WEB_PORT` | `2019` | Apache | Main application. `/admin`, `/generador`, `/reciclador`. |
+| `VITE_PORT` | `5173` | Vite HMR | Dev target only. Not used in production images. |
+| `DB_DOCKER_PORT` | `5432` | PostgreSQL | Published to the host for local inspection tools. |
+| `ADMINER_PORT` | `2020` | Adminer | Only starts with `--profile tools`. |
+| `MAIL_UI_PORT` | `8025` | Mailpit | Captured mail web UI. Always starts (no profile). |
+
+## Security Headers
+
+`server/security-headers.conf` is loaded by Apache in both targets via `a2enconf security-headers`. It sets the following HTTP response headers:
+
+- **`Strict-Transport-Security`** — `max-age=31536000; includeSubDomains; preload`. Forces HTTPS for one year. Only effective once deployed with a real TLS certificate; activating this on plain HTTP locks browsers out. The configuration is included by the Dockerfile only in the `prod` target.
+- **`X-Content-Type-Options: nosniff`** — Prevents browsers from MIME-sniffing uploaded files as HTML.
+- **`X-Frame-Options: SAMEORIGIN`** — Clickjacking protection for older browsers. Modern browsers rely on the `frame-ancestors` directive in the CSP middleware instead.
+- **`Referrer-Policy: strict-origin-when-cross-origin`** — Limits URL leakage when navigating from lot detail pages to the MADES SIAM portal or to Pagopar.
+- **`Permissions-Policy`** — Disables unused browser APIs. `geolocation=(self)` is intentionally allowed because `FiltrosSidebar.tsx` uses `navigator.geolocation`. `clipboard-write` is not listed (defaults to `self`) because Filament's `->copyable()` columns require it.
+- **`X-Powered-By`** — Unconditionally removed (`Header always unset`). PHP's `expose_php = Off` already suppresses it; this header handles any intermediate proxy that might add it back.
+- **Note:** `X-XSS-Protection` was removed on purpose — it is deprecated, not implemented in any current browser, and its filter introduced known vulnerabilities in older implementations.
+
+<Note>
+  The `Content-Security-Policy` header is **not** set in this file. Because Laravel's `.htaccess` rewrites all requests to `index.php`, Apache cannot distinguish `/marketplace` from `/admin/login` by the time headers are emitted. The CSP is applied by `App\Http\Middleware\ContentSecurityPolicy`, which sees the real route and is testable in the suite.
+</Note>
+
+## Session and Cookie Hardening
+
+Two cookie settings must be changed when deploying with HTTPS:
+
+```ini
+# web/.env (production)
+SESSION_SECURE_COOKIE=true
+SESSION_SAME_SITE=lax
+```
+
+| Variable | Dev default | Production value | Why |
+|---|---|---|---|
+| `SESSION_SECURE_COOKIE` | *(empty)* | `true` | Prevents the session cookie from being sent over plain HTTP. Left empty in dev because HTTP is the default and `true` would break login silently. |
+| `SESSION_SAME_SITE` | `lax` | `lax` | `lax` lets the session cookie travel when returning from the Pagopar payment gateway (a top-level navigation from `pagopar.com`). `strict` would drop the session on return, logging the buyer out right after paying. |
+
+## Service Architecture
+
+ExcedentMarket runs as three application containers that share the same image and volumes:
+
+<CardGroup cols={3}>
+  <Card title="web" icon="globe">
+    Runs Apache + the entrypoint. Owns all database initialization (migrations, seeding). Exposes HTTP on `WEB_PORT`.
+  </Card>
+  <Card title="queue" icon="arrow-right-arrow-left">
+    Runs `php artisan queue:work`. Starts only after `web` is healthy (post-migration). Shares `app_state` and `private_storage` volumes so it can decrypt job payloads and write ARCO export files.
+  </Card>
+  <Card title="scheduler" icon="clock">
+    Runs `php artisan schedule:work`, which replaces the system cron (absent from the image). Starts after `web` is healthy. Without this container, no `Schedule::command()` in `routes/console.php` ever executes — no license alerts, no DNIT imports, no payment reminders.
+  </Card>
+</CardGroup>
+
+The `queue` and `scheduler` containers disable the image-level health check (which polls `/up` via HTTP) because they don't run Apache. They depend on `web: condition: service_healthy`, guaranteeing the database is migrated and seeded before they start.
+
+## Mailpit
+
+Mailpit captures every outgoing email and displays it in a web UI at `http://localhost:${MAIL_UI_PORT}` (default `http://localhost:8025`). No email reaches real recipients in this mode. This is intentional: during evaluation, real company email addresses are loaded from demo data and none of them should receive email from an academic prototype.
+
+<Warning>
+  In production, replace the Mailpit SMTP settings with a real provider (Brevo, Gmail app password, Postmark, etc.) in `web/.env`. Leaving `MAIL_HOST=mail` and `MAIL_PORT=1025` in production silently drops all outgoing notifications.
+</Warning>
+
+## Adminer
+
+Adminer is not started by default. It is guarded by the `tools` Compose profile to avoid accidentally exposing the database UI:
+
+```bash
+# Start Adminer alongside the rest of the stack
+docker compose --profile tools up -d
+```
+
+Connect with server `database`, engine PostgreSQL, and the credentials from `.env` (`DB_USERNAME` / `DB_PASSWORD`).
+
+## APP_ENV Values
+
+| Value | Behavior |
+|---|---|
+| `local` | Development. Vite HMR active. Debug on. MANTENER_DATOS respected. |
+| `development` | Same behavior as `local` but useful for shared dev environments. |
+| `staging` | Destructive operations blocked. Debug off. Pre-built assets. |
+| `production` | All production hardening. APP_KEY must be set explicitly. OPcache frozen. Config/route/view/event/icon caches built at startup. |

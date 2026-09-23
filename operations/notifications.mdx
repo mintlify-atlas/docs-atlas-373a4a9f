@@ -1,0 +1,286 @@
+---
+title: "System Notifications and Email Events in ExcedentMarket"
+sidebarTitle: "Notifications"
+description: "Every notification class in ExcedentMarket: which events trigger them, who receives them, their priority level, and how to inspect them in development."
+---
+
+ExcedentMarket's notification system is built on a single abstract base class, `NotificacionDelSistema`, that every notification extends. All notifications are dispatched asynchronously via the `queue` container and delivered on **two channels simultaneously**: `database` (the in-panel bell icon and Notifications page) and `mail` (email via the configured SMTP provider). The database channel works without SMTP, so the panel always shows notifications even in environments without a real mail server. Adding a real SMTP provider activates email delivery without any code change.
+
+## Notification Channels
+
+<CardGroup cols={2}>
+  <Card title="Database (in-panel)" icon="bell">
+    Every notification is stored in the `notifications` table in the format Filament expects (`data->format = 'filament'`). The bell icon in each panel updates in real time and lets users mark notifications as read. The full **Notificaciones** page in each panel provides filtering by type and priority.
+  </Card>
+  <Card title="Mail (email)" icon="envelope">
+    Every notification also generates a `MailMessage` via its `toMail()` method. In development, Mailpit captures all outgoing email — nothing reaches real recipients. In production, messages are delivered by the configured SMTP provider.
+  </Card>
+</CardGroup>
+
+<Note>
+  In development, all outgoing email is captured by Mailpit and displayed at `http://localhost:8025` (configurable via `MAIL_UI_PORT`). No email reaches real recipients. This is intentional: evaluation environments load real company email addresses from demo data, and none of them should receive mail from an academic prototype.
+</Note>
+
+## Priority Levels
+
+Each notification declares a `PrioridadNotificacion` that drives the icon color in the panel bell and the sorting order on the Notifications page:
+
+| Priority | Meaning |
+|---|---|
+| **Alta** | Requires immediate action or signals a blocking situation (license expired, security incident, payment overdue, ARCO request with a legal deadline). |
+| **Media** | Action is required but not immediately blocking (new offer, counter-offer accepted, documents ready to download, lot past deadline). |
+| **Baja** | Informational — confirms a completed event that requires no further action (payment confirmed, offer rejected, privacy request acknowledged). |
+
+---
+
+## Commercial Flow Notifications
+
+These notifications track the offer, counter-offer, payment, and physical delivery cycle between generators and recyclers.
+
+<Accordion title="OfertaRecibidaNotification — New offer arrived">
+  **Recipient:** Generator (the user who published the lot)
+
+  **Trigger:** A recycler submits a new offer on a published lot.
+
+  **Priority:** Media — there is a decision to make (accept or reject) and a 30-day window, but nothing breaks on the day the alert arrives.
+
+  **Content:** Includes the lot photo (to distinguish among multiple lots of the same material), the offered unit price, the total amount for the full lot, and a direct link to the Offers section of the generator's panel.
+
+  **Type key:** `oferta_recibida`
+</Accordion>
+
+<Accordion title="OfertaResueltaNotification — Offer accepted or rejected">
+  **Recipient:** Recycler (the user who submitted the offer)
+
+  **Trigger:** The generator accepts or rejects an offer.
+
+  **Priority:** Media when accepted (a contract was created and needs payment); Baja when rejected (nothing left to do).
+
+  **Content:** When accepted, links directly to the new contract (which is where the "Pay" action lives). When rejected, links to the recycler's offer list.
+
+  **Type key:** `oferta_resuelta`
+</Accordion>
+
+<Accordion title="ContraofertaRecibidaNotification — Counter-offer submitted">
+  **Recipient:** Recycler (the buyer who made the original offer)
+
+  **Trigger:** The generator submits a counter-proposal.
+
+  **Priority:** Alta — this is the only offer-cycle notification at this priority because the lot stays in `en_negociacion` (and off the marketplace) until the recycler responds. The block belongs to the recipient.
+
+  **Content:** Shows both amounts (original offer and counter-offer), each as a unit price and lot total, and a link to the recycler's offer list where the Accept/Reject buttons live.
+
+  **Type key:** `contraoferta_recibida`
+</Accordion>
+
+<Accordion title="ContraofertaRespondidaNotification — Counter-offer response received">
+  **Recipient:** Generator (the seller who submitted the counter-offer)
+
+  **Trigger:** The recycler accepts or rejects the counter-offer.
+
+  **Priority:** Media when accepted (a contract was created, awaiting payment); Baja when rejected (the lot returns to available if no other offers are active).
+
+  **Content:** States the counter-offer unit price and the outcome. Links to the generator's received-offers page.
+
+  **Type key:** `contraoferta_respondida`
+</Accordion>
+
+<Accordion title="ContratoPendienteDePagoNotification — Payment reminder">
+  **Recipient:** Recycler (the buyer with the pending contract)
+
+  **Trigger:** The `operacion:recordar-pagos-pendientes` scheduled command (daily at 09:00), after a configurable silence window. Only the buyer receives this — the seller has no action available and the reminder would read as a reproach.
+
+  **Priority:** Media for the first reminders; Alta once the contract has been waiting longer than `$diasParaUrgente` days (default 15). The escalation reflects that a long-pending contract is not a delayed transaction but a blocked one that is holding the seller's material off the market.
+
+  **Content:** Includes the lot photo, the number of days elapsed since adjudication, the exact payment amount (the material amount only — the platform commission is deducted from the generator's proceeds, not added to the buyer's charge), and a link directly to the contract's detail page where the Pay button lives.
+
+  **Type key:** `contrato_pendiente_pago`
+</Accordion>
+
+<Accordion title="PagoConfirmadoNotification — Payment confirmed">
+  **Recipient:** Both the generator and the recycler
+
+  **Trigger:** The payment gateway confirms the transaction.
+
+  **Priority:** Baja — confirms a completed fact, no action required from either party.
+
+  **Content:** Payment amount and status. Each recipient receives a link to the contract in *their own panel* — this was previously hard-coded to `/reciclador`, which gave the generator a button to a panel they cannot access.
+
+  **Type key:** `pago_confirmado`
+</Accordion>
+
+<Accordion title="DocumentacionContratoEmitidaNotification — Contract documents ready">
+  **Recipient:** Both the generator and the recycler
+
+  **Trigger:** The `GenerarDocumentosContratoJob` queue job finishes generating contract documents (the transmission certificate and environmental certificates).
+
+  **Priority:** Media — there is something to download and archive, but no expiry.
+
+  **Content:** Lists only the documents that *actually exist* (not a fixed list), explains that each document contains a QR code for authenticity verification without login, and links to the contract. These documents are legally required under Ley N.° 3956/2009: the generator needs the transmission certificate as proof of lawful disposal; the recycler needs the environmental certificate as proof of valorization.
+
+  **Type key:** `documentacion_contrato`
+</Accordion>
+
+<Accordion title="CircuitoRetiroNotification — Physical pickup progress">
+  **Recipient:** The counterpart for each act (generator notified of recycler's actions, recycler notified of generator's actions)
+
+  **Trigger:** One of three acts in the transmission circuit: `entrega` (generator marks cargo ready), `retiro` (recycler declares pickup), `recepcion` (recycler confirms reception at their facility).
+
+  **Priority:** Media for `entrega` and `retiro` (something still pending); Baja for `recepcion` (operation fully closed).
+
+  **Content:** A single class handles all three acts — the title, body, and icon adapt to the act. When the act is `entrega`, the delivery note number (`numero_nota_remision`) is included in the email if present. All three link to the contract.
+
+  **Type key:** `circuito_retiro`
+</Accordion>
+
+---
+
+## Compliance & Monitoring Notifications
+
+These notifications support regulatory compliance under Ley N.° 3956/2009 and the DNIT/MADES integrations.
+
+<Accordion title="LicenciaProximaVencerNotification — License expiry alert">
+  **Recipient:** Administrators and the generator's own users
+
+  **Trigger:** The `ambiental:alertar-licencias` scheduled command (weekly, Mondays at 08:00). Sent after SIAM license validation runs at 06:30 on the same day, so the alert reflects fresh validation results.
+
+  **Priority:** Alta when the license is already expired or its validity period is indeterminate (company cannot publish lots in either case); Media when it is approaching expiry (still operational).
+
+  **Content:** The message text varies by state — expired licenses prompt submitting an audit compliance report to MADES; indeterminate ones ask the user to complete the license record (not to renew, because that is the wrong action for a document that never had an expiry date). Each recipient's link goes to the license list in *their own panel*.
+
+  **Type key:** `licencia_vence` or `licencia_indeterminada`
+</Accordion>
+
+<Accordion title="LicenciaSinCorrelatoSiamNotification — SIAM mismatch alert">
+  **Recipient:** The company's users and administrators
+
+  **Trigger:** `siam:validar-licencias` discovers that an uploaded license's SIAM expedition number either does not exist in the MADES registry or is registered to a different taxpayer (RUC).
+
+  **Priority:** Alta when the expedition belongs to another taxpayer (requires investigation — not just a typo); Media when the expedition number is not found (likely a data entry error).
+
+  **Content:** Explains the exact mismatch and provides actionable guidance for each case. Does **not** trigger when the MADES portal is unavailable — a network outage says nothing about the license's legitimacy, and falsely alerting on a connectivity failure would accuse a company of irregularity for an external failure.
+
+  **Type key:** `licencia_siam`
+</Accordion>
+
+<Accordion title="RucObservadoNotification — RUC status change alert">
+  **Recipient:** Administrators only
+
+  **Trigger:** The `dnit:importar-padron` command (last day of each month at 03:00) re-validates all registered companies against the updated DNIT taxpayer registry.
+
+  **Priority:** Alta — companies with a cancelled RUC or absent from the registry should not continue operating, and there is an open situation to resolve.
+
+  **Content:** A single notification summarises the entire re-validation run (cancelled count + not-found count), rather than one notification per company. The link goes directly to the "RUC Irregular / Cancelled" tab on the companies list.
+
+  **Type key:** `ruc_observado`
+</Accordion>
+
+<Accordion title="LoteVencidoNotification — Lot past deadline">
+  **Recipient:** The generator who owns the lot
+
+  **Trigger:** The `lotes:avisar-vencidos` scheduled command (daily at 09:00), with a 7-day silence window per lot to prevent daily repetition.
+
+  **Priority:** Media — a stale lot blocks only its own owner's stock; there is no third party waiting. Priority does not escalate with time, because leaving a lot open past its date may be a deliberate commercial decision.
+
+  **Content:** Includes the lot photo, material name and quantity, how many days past the deadline, any open (unanswered) offers still attached, and the note that the material continues to count as committed stock until the lot is closed or its deadline is extended. The system never closes the lot automatically.
+
+  **Type key:** `lote_vencido`
+</Accordion>
+
+<Accordion title="UmbralGeneradorNotification — Large-generator threshold">
+  **Recipient:** The generator company's users (not administrators)
+
+  **Trigger:** The `ambiental:alertar-umbral-generador` scheduled command (first day of each month at 08:00), when a company's rolling 12-month waste total through the platform reaches 80% or more of the 10,000 kg annual threshold set by Decreto N.° 7.391/17.
+
+  **Priority:** Media while approaching the threshold; Alta once 100% is crossed (the company is operating in the large-generator range and should initiate re-categorisation with the competent authority).
+
+  **Content:** States the exact accumulated tonnage and the percentage of the threshold, with the rolling window dates. Explicitly states that this calculation covers only operations registered on the platform and does not constitute an official category determination. Warns when retiros with non-convertible units (litres, pieces) were excluded from the calculation, as those understate the true total.
+
+  **Type key:** `umbral_generador`
+</Accordion>
+
+---
+
+## Privacy (ARCO) Flow Notifications
+
+These three notifications implement the personal data rights flow under Ley N.° 7.593/2025.
+
+<Accordion title="SolicitudPrivacidadRecibidaNotification — ARCO request acknowledged">
+  **Recipient:** The data subject (the user who submitted the request)
+
+  **Trigger:** An ARCO (Access, Rectification, Cancellation, Opposition) request is submitted via the *Mi Privacidad* page.
+
+  **Priority:** Baja — this is an acknowledgement for the user. The 30-business-day response clock runs against the platform, not the user.
+
+  **Content:** Confirms the type of right exercised and the 30-business-day response deadline. Links to the *Mi Privacidad* page in the user's own panel (previously hard-coded to `/generador/mi-privacidad`, which sent recyclers to an inaccessible panel).
+
+  **Type key:** `privacidad_recibida`
+</Accordion>
+
+<Accordion title="SolicitudPrivacidadParaResolverNotification — ARCO request assigned">
+  **Recipient:** Administrators
+
+  **Trigger:** Same event as `SolicitudPrivacidadRecibidaNotification` — this is a **different notification for a different recipient** about the same request. Exists because the administrator's message is an assignment with a legal deadline, not an acknowledgement.
+
+  **Priority:** Alta always — the 30-business-day deadline is legally enforceable and runs from the moment the platform receives the request.
+
+  **Content:** Identifies the data subject by name, the type of right requested, any description provided, and the legal deadline. Links directly to the request's edit page in the admin panel (where the response form and resolution action live).
+
+  **Type key:** `privacidad_para_resolver`
+</Accordion>
+
+<Accordion title="SolicitudPrivacidadRespondidaNotification — ARCO request resolved">
+  **Recipient:** The data subject
+
+  **Trigger:** An administrator marks the ARCO request as resolved.
+
+  **Priority:** Media when a download file was generated (the data export file has a 30-day retention window via `privacy:purgar-legajos` and a signed URL that expires — the user must act); Baja otherwise.
+
+  **Content:** States the outcome, includes the administrator's written response if provided, notes if a file is available for download, and links to *Mi Privacidad*. When a file is present, the button label changes to "Descargar la respuesta" to make the action explicit.
+
+  **Type key:** `privacidad_respondida`
+</Accordion>
+
+---
+
+## Security Notification
+
+<Accordion title="IncidenteSeguridadDetectadoNotification — Security incident opened">
+  **Recipient:** Administrators only
+
+  **Trigger:** `DeteccionIncidentes` automatically opens a security incident record (e.g. on brute-force detection, suspicious data access patterns).
+
+  **Priority:** Alta always, regardless of the incident's own severity rating. The severity describes the incident; the priority describes when it must be reviewed. An unreviewed incident — even a minor one — consumes the notification deadline under Ley N.° 7.593/2025 for reporting to the ANPDP (Autoridad Nacional de Protección de Datos Personales) without anyone acting.
+
+  **Content:** Incident type, severity, description, and affected data subject count if non-zero. Instructs the administrator to document containment measures and evaluate whether notification to the ANPDP and affected data subjects is required. Links to the incident's detail record. This notification does **not** go to affected data subjects — that communication is a decision of the data controller (the administrator), made with its own content, timing, and record, from within the incident record itself.
+
+  **Type key:** `incidente_seguridad`
+</Accordion>
+
+---
+
+## Scheduled Command Summary
+
+The following `routes/console.php` schedules drive the automated notification commands:
+
+| Command | Schedule | Notification(s) triggered |
+|---|---|---|
+| `privacy:limpiar-audit-logs --force` | Daily 03:30 | None (maintenance) |
+| `privacy:purgar-legajos --force` | Daily 03:45 | None (file purge) |
+| `siam:validar-licencias --reintentar` | Weekly Mon 06:30 | `LicenciaSinCorrelatoSiamNotification` |
+| `ambiental:alertar-licencias` | Weekly Mon 08:00 | `LicenciaProximaVencerNotification` |
+| `dnit:importar-padron` | Last day of month 03:00 | `RucObservadoNotification` |
+| `operacion:recordar-pagos-pendientes` | Daily 09:00 | `ContratoPendienteDePagoNotification` |
+| `lotes:avisar-vencidos` | Daily 09:00 | `LoteVencidoNotification` |
+| `ambiental:alertar-umbral-generador` | 1st of month 08:00 | `UmbralGeneradorNotification` |
+
+<Warning>
+  All scheduled commands require the `scheduler` container to be running. The `web` container runs Apache only — it has no cron daemon. Without the scheduler service, none of these notifications will ever be dispatched.
+</Warning>
+
+## Accessing Notifications in the Panel
+
+Each panel (Admin, Generador, Reciclador) exposes two notification surfaces:
+
+1. **Bell icon** — Shows unread notifications using Filament's built-in notification component. Clicking a notification's action button marks it as read automatically.
+2. **Notificaciones page** — A full filterable list accessible from the panel navigation. Supports filtering by type key (e.g. `oferta_recibida`, `licencia_vence`) and by priority level.

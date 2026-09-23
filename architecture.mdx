@@ -1,0 +1,235 @@
+---
+title: "ExcedentMarket System Architecture and Technology Stack"
+sidebarTitle: "Architecture"
+description: "A deep dive into ExcedentMarket's multi-service Docker architecture, three Filament panels, Inertia 2 + React 19 frontend, and key engineering conventions."
+---
+
+ExcedentMarket is built as a single cohesive Laravel 13 application that serves two distinct rendering surfaces — Filament-powered admin panels for authenticated role workflows, and an Inertia 2 + React 19 frontend for the public marketplace — running as a coordinated set of Docker Compose services backed by PostgreSQL 16. Understanding how these layers fit together is essential for navigating the codebase, extending the platform, or troubleshooting a running deployment.
+
+## Technology Stack
+
+<CardGroup cols={2}>
+  <Card title="Laravel 13 / PHP 8.3" icon="php">
+    Application framework. Strict types enforced throughout. Models use explicit `$fillable` arrays — never `$guarded = []`. Generated with Artisan first; hand-written code only when no generator exists.
+  </Card>
+  <Card title="Filament 5" icon="table-columns">
+    Three Filament panels power all authenticated role UIs. Layouts use `Filament\Schemas\Components\*`, actions use `Filament\Actions\*`. Badges via `TextColumn::make()->badge()`.
+  </Card>
+  <Card title="Inertia 2 + React 19" icon="react">
+    Public-facing routes rendered server-side by Laravel and hydrated client-side by React. Uses the Inertia JS adapter v3 (`@inertiajs/react ^3.5.0`) with `use_script_element_for_initial_page: true`.
+  </Card>
+  <Card title="Tailwind v4" icon="paintbrush">
+    Design tokens live in `@theme {}` blocks inside CSS files. No `tailwind.config.js`, no `postcss.config.js`, no `@tailwind` directives. Icons come from Font Awesome via CDN — no emoji in code or strings.
+  </Card>
+  <Card title="PostgreSQL 16" icon="database">
+    Primary data store. The test suite runs on SQLite for speed, but PostgreSQL-specific features (CHECK constraints, custom column types, full-text search) are validated separately via `scripts/verificar_motor_real.sh`.
+  </Card>
+  <Card title="Docker Compose" icon="docker">
+    Single `compose.yml` orchestrates all services. Two Dockerfile build targets: `dev` (Node + dev deps, opcache revalidating) and `prod` (no Node, classmap-authoritative autoloader, opcache frozen).
+  </Card>
+</CardGroup>
+
+## Docker Services
+
+The platform runs as five cooperating services defined in `compose.yml`. All services share the same base Docker image built from a common PHP + Apache + extensions layer, ensuring the PHP version and extension set are identical across environments.
+
+| Service | Image / Role | Published Ports | Key Volumes |
+|---|---|---|---|
+| `web` | PHP 8.3 + Apache 2 + Vite HMR (dev) | `2019:80`, `5173:5173` | `cv_storage`, `private_storage`, `app_state`, `node_modules` |
+| `queue` | Laravel queue worker (`queue:work`) | — | `app_state`, `cv_storage`, `private_storage` |
+| `scheduler` | Laravel task scheduler (`schedule:work`) | — | `app_state`, `cv_storage`, `private_storage` |
+| `database` | `postgres:16-alpine` | `5432:5432` | `pgdata` |
+| `mail` | `axllent/mailpit:latest` | `8025:8025` | — |
+
+`adminer` is available under the `tools` profile and is not started by default:
+
+```bash
+docker compose --profile tools up -d
+```
+
+### Service dependency and startup order
+
+The `queue` and `scheduler` services declare `depends_on: web: condition: service_healthy`. This means they only start after `web` passes its health check at `GET /up` — by which point migrations, permission generation, and seeding are guaranteed to have completed. Neither `queue` nor `scheduler` run migrations or seeders; that responsibility belongs exclusively to `web` to eliminate first-run race conditions.
+
+```yaml
+# compose.yml — queue dependency declaration
+depends_on:
+  database:
+    condition: service_healthy
+  web:
+    condition: service_healthy
+```
+
+## Named Volumes
+
+Each volume has a specific purpose and scope. Sharing `app_state` across `web`, `queue`, and `scheduler` is the mechanism by which all services agree on the same `APP_KEY` — without it, the queue worker would generate its own key and be unable to decrypt encrypted job payloads.
+
+| Volume | Purpose |
+|---|---|
+| `cv_storage` | Public files (uploaded material images, generated contract PDFs). Served at `/storage` via the `storage:link` symlink. |
+| `private_storage` | ARCO personal data exports. **Not** served over HTTP. Written by `ProcesarSolicitudArcoJob` and served via an authenticated download route. |
+| `app_state` | Persisted `APP_KEY`. Shared by `web`, `queue`, and `scheduler` so all services encrypt and decrypt with the same key. |
+| `pgdata` | PostgreSQL 16 data directory. |
+| `node_modules` | npm packages. Mounted as a volume so `npm ci` during development does not re-download on every rebuild. |
+
+## Filament Panels
+
+Three Filament 5 panels are registered in `bootstrap/app.php`, each with its own route prefix, guard, and permission set managed by Filament Shield (`bezhansalleh/filament-shield ^4.0`).
+
+<Tabs>
+  <Tab title="/admin">
+    **Admin panel** — platform operator interface.
+
+    - Route prefix: `/admin`
+    - Guard: `admin` (or the platform's unified guard, depending on config)
+    - Seed user: `admin@excedentmarket.com` / `admin1234`
+    - Capabilities: user approval, category management, CO₂ reporting, ARCO request handling, DNIT padron import
+
+    Standalone pages (no resource) live in `app/Filament/Admin/Pages/`. Resource pages live in `app/Filament/Admin/Resources/<X>Resource/Pages/`.
+  </Tab>
+  <Tab title="/generador">
+    **Generador panel** — waste generator interface.
+
+    - Route prefix: `/generador`
+    - Seed user: `generador@excedentmarket.com` / `generador1234`
+    - Capabilities: material listings, incoming offer management, counter-offer flow, contract signing, payment initiation
+
+    Standalone pages live in `app/Filament/Generador/Pages/`. Resource pages in `app/Filament/Generador/Resources/<X>Resource/Pages/`.
+  </Tab>
+  <Tab title="/reciclador">
+    **Reciclador panel** — certified recycler interface.
+
+    - Route prefix: `/reciclador`
+    - Seed user: `reciclador@excedentmarket.com` / `reciclador1234`
+    - Capabilities: marketplace browsing, offer submission, negotiation tracking, contract acceptance, payment completion, SIAM licence management
+
+    Standalone pages live in `app/Filament/Reciclador/Pages/`. Resource pages in `app/Filament/Reciclador/Resources/<X>Resource/Pages/`.
+  </Tab>
+</Tabs>
+
+<Warning>
+**Filament page placement is strictly enforced.** Only standalone pages (those with no `$resource` property, e.g. `MiPrivacidad`) belong in `app/Filament/<Panel>/Pages/`. That directory is auto-discovered by `discoverPages()`. Placing a resource page there causes it to be registered twice — once via `getPages()` and once via auto-discovery — which makes `shield:generate` abort with `duplicate key ... role_has_permissions`.
+
+Every `getPages()` entry must point to a class in `app/Filament/<Panel>/Resources/<X>Resource/Pages/` with a non-nullable `protected static string $resource`. Never register vendor base classes (e.g. `\Filament\Resources\Pages\EditRecord::route(...)`) — they have no `$resource` assignment and will throw a PHP fatal on container boot.
+</Warning>
+
+## Frontend: Inertia 2 + React 19
+
+Public-facing routes (marketplace catalogue, listing detail, authentication pages) are rendered by the Inertia + React layer. Filament panel routes are rendered entirely by Filament and do not use Inertia.
+
+### Inertia adapter version
+
+The project uses `@inertiajs/react ^3.5.0` (the v3 JS adapter) alongside `inertiajs/inertia-laravel ^2.0` (the v2 Laravel adapter). The v3 JS adapter reads the initial page payload from a `<script type="application/json">` element, **not** from a `<div data-page>` attribute as in older versions. This requires a specific configuration flag in `config/inertia.php`:
+
+```php
+// config/inertia.php
+'use_script_element_for_initial_page' => true,
+```
+
+The root Blade view must use the `@inertia` directive. Writing a `<div data-page>` by hand produces `Cannot read properties of null (reading 'component')` in the browser console — the symptom of using the v2 page format with a v3 adapter.
+
+### Tailwind v4
+
+Tailwind v4 eliminates the `tailwind.config.js` file entirely. Design tokens and custom utilities are defined in `@theme {}` blocks within CSS source files:
+
+```css
+/* resources/css/app.css */
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #1a6b3c;
+  --font-sans: "Inter", sans-serif;
+}
+```
+
+There is no `postcss.config.js` and no `@tailwind base` / `@tailwind components` / `@tailwind utilities` directives. The `@tailwindcss/vite` plugin (`^4.3.1`) integrates Tailwind directly into the Vite pipeline.
+
+### Key JS dependencies
+
+```json
+{
+  "dependencies": {
+    "@inertiajs/react": "^3.5.0",
+    "@radix-ui/react-dialog": "^1.1.17",
+    "@radix-ui/react-dropdown-menu": "^2.1.18",
+    "axios": "^1.18.1",
+    "leaflet": "^1.9.4",
+    "lucide-react": "^1.21.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-leaflet": "^5.0.0"
+  }
+}
+```
+
+Leaflet and `react-leaflet` power the geographic map view of material listings. Radix UI primitives provide accessible dialog and dropdown components. Icons in the React layer use `lucide-react`; Filament panel icons use the Heroicons set included with Filament.
+
+## Data Flow
+
+```
+Browser
+  │
+  ├─ /admin, /generador, /reciclador  ──►  Filament 5 panels (Livewire / Alpine)
+  │                                          Rendered by Filament, returned as HTML
+  │
+  └─ / , /marketplace, /listings/*  ──►  Laravel Router
+                                           │
+                                           ▼
+                                     Inertia middleware
+                                           │
+                                    First request: full HTML
+                                    (script[type=application/json] payload)
+                                           │
+                                    Subsequent requests: JSON
+                                    (X-Inertia: true header)
+                                           │
+                                           ▼
+                                     React 19 (client hydration)
+                                     Tailwind v4 styles
+```
+
+Background work (contract PDF generation, DNIT import, ARCO data exports, CO₂ recalculation, licence expiry alerts) is dispatched as queued jobs processed by the `queue` service. Scheduled tasks (monthly DNIT padron import, audit log purge, upcoming licence expiry notifications) run via `schedule:work` in the `scheduler` service.
+
+## Dockerfile Build Stages
+
+The Dockerfile uses multi-stage builds with two named output targets, sharing a common `base` layer so extension sets are identical between environments.
+
+| Stage | Purpose |
+|---|---|
+| `base` | PHP 8.3 + Apache, system packages (`gosu`, `postgresql-client`, `tesseract-ocr`, `poppler-utils`), all PHP extensions, Apache virtual host config |
+| `vendor-prod` | Composer production dependencies (`--no-dev`) |
+| `vendor-dev` | Composer all dependencies (including dev) |
+| `assets` | Node 22 — runs `npm ci` + `vite build`, outputs `public/build/` |
+| `dev` | Final dev image: copies Node binaries, `vendor-dev`, and `public/build/` (as a fallback if Vite HMR hasn't started). `opcache.validate_timestamps = 1` |
+| `prod` | Final prod image: no Node, `vendor-prod`, `public/build/`. `opcache.validate_timestamps = 0`, classmap-authoritative autoloader |
+
+<Tip>
+The `dev` target includes a pre-built `public/build/` copied from the `assets` stage. This acts as a safety net: if the Vite HMR dev server is slow to start or unavailable (e.g., when `APP_URL` is `https://` and the HTTP dev server would be blocked as mixed content), `@vite` falls back to `public/build/manifest.json` and the application still loads correctly.
+</Tip>
+
+## Key Conventions
+
+These conventions are not always visible from the code alone. Violating them causes failures that are difficult to diagnose.
+
+<Accordion title="Filament page placement rules">
+  - `app/Filament/<Panel>/Pages/` — standalone pages only (no `$resource`). Auto-discovered by `discoverPages()`.
+  - `app/Filament/<Panel>/Resources/<X>Resource/Pages/` — resource pages only. Registered via `getPages()` in the resource class.
+  - Every resource page class must have `protected static string $resource` (non-nullable). Vendor base classes lack this and throw a PHP fatal.
+  - When moving a class between directories, update its `namespace` to match. PSR-4 will throw "Cannot redeclare class" if path and namespace diverge.
+</Accordion>
+
+<Accordion title="Tailwind v4 configuration">
+  All Tailwind configuration (theme tokens, custom utilities, plugin imports) lives in `@theme {}` blocks inside CSS source files. There is no `tailwind.config.js` or `postcss.config.js`. Do not use the `@tailwind base`, `@tailwind components`, or `@tailwind utilities` directives — they are a Tailwind v3 pattern and do not exist in v4.
+</Accordion>
+
+<Accordion title="No emoji in code or strings">
+  Emoji characters must not appear in PHP or TypeScript source code, database strings, log messages, or Artisan output. Icons in Filament panels use the Heroicons set. Icons in the React frontend use `lucide-react` or Font Awesome via CDN.
+</Accordion>
+
+<Accordion title="Model conventions">
+  Every Eloquent model must declare `declare(strict_types=1)` at the top of the file. Use explicit `$fillable` arrays — never `protected $guarded = []`. Public methods must have explicit return type declarations. Generate models and resources with Artisan (`make:model`, `make:filament-resource`) before writing by hand.
+</Accordion>
+
+<Accordion title="Credential logging prohibition">
+  No password, password length, or `$credentials` array may ever be written to any log channel. This applies to authentication controllers, middleware, and any debugging code.
+</Accordion>

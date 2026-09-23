@@ -1,0 +1,171 @@
+---
+title: "Inventory Management and Stock Tracking for Waste Lots"
+sidebarTitle: "Inventory"
+description: "How ExcedentMarket tracks warehouse stock, reserves material against active lots, and records double-entry movements when contracts complete."
+---
+
+ExcedentMarket's inventory layer enforces a double-entry accounting model for physical waste material: every kilogram that leaves a generator's warehouse is recorded as an egress movement, and every kilogram that arrives at a recycler's warehouse is recorded as a corresponding ingress. This bidirectional traceability is mandated by ISO 59004's principle of resource traceability and closes the origin-to-destination chain that the circular economy framework requires.
+
+## Core Entities
+
+<CardGroup cols={2}>
+  <Card title="Almacen" icon="warehouse">
+    Represents a physical warehouse belonging to a company. Each `Empresa` can have multiple warehouses. `InventarioService` uses the warehouse declared on the lot (`lote.almacen_id`) as the egress source, falling back to the company's first warehouse for legacy lots.
+  </Card>
+  <Card title="Stock" icon="boxes-stacked">
+    Tracks the current quantity of a specific material in a specific warehouse (`material_id + almacen_id`). Updated atomically with a `lockForUpdate()` to prevent double-deductions from concurrent contract completions.
+  </Card>
+  <Card title="MovimientoStock" icon="arrow-right-arrow-left">
+    An immutable ledger entry. Every stock change — whether ingress or egress — creates a `MovimientoStock` record linked to the originating contract. The ledger is never updated in place.
+  </Card>
+  <Card title="LotePublicado" icon="tag">
+    The lot ties together a material, a warehouse (`almacen_id`), and the published quantity. Its state determines whether the material is available, reserved, or released.
+  </Card>
+</CardGroup>
+
+## Stock Reservation States
+
+Material is considered **reserved** (unavailable for re-publication) while its lot is in any of these states:
+
+```php
+// app/Models/LotePublicado.php
+public const ESTADOS_RESERVAN_STOCK = ['publicado', 'en_negociacion', 'adjudicado'];
+```
+
+This is deliberately broader than `ESTADOS_VISIBLES` (`['publicado', 'en_negociacion']`):
+
+| State | Visible in catalog | Reserves stock | Explanation |
+|---|---|---|---|
+| `publicado` | ✅ | ✅ | Lot is live; material is committed |
+| `en_negociacion` | ✅ | ✅ | Offers are open; material is still committed |
+| `adjudicado` | ❌ | ✅ | Lot sold; physically still in the warehouse until contract completes |
+| `cerrado` | ❌ | ❌ | Lot withdrawn; material is free again |
+| `completado` | ❌ | ❌ | Contract done; egress already recorded |
+
+<Warning>
+  An `adjudicado` lot has **left the catalog** — no new offers can be submitted — but its material is still physically in the generator's warehouse. `LotePublicado::cantidadComprometida()` includes adjudicado lots when computing reserved quantities, preventing double-publication of the same physical stock.
+</Warning>
+
+The `scopeReservanStock()` query scope applies this filter:
+
+```php
+// app/Models/LotePublicado.php
+public function scopeReservanStock(Builder $query): Builder
+{
+    return $query->whereIn($this->qualifyColumn('estado'), self::ESTADOS_RESERVAN_STOCK);
+}
+```
+
+## InventarioService — Double-Entry Registration
+
+When a contract reaches the `activo` state (payment confirmed), `InventarioService::registrarPorContrato()` records both movements in a single transaction:
+
+```php
+// app/Services/InventarioService.php
+public function registrarPorContrato(Contrato $contrato): void
+{
+    if ($contrato->movimientosStock()->exists()) {
+        return; // Idempotent: already recorded
+    }
+
+    DB::transaction(function () use ($contrato, $lote, $materialId, $cantidad, ...): void {
+        // Egress: material leaves the generator's warehouse
+        $this->anotarMovimiento($contrato->id, $materialId, $almacenGenerador->id,
+            MovimientoStock::TIPO_EGRESO, $cantidad);
+        $this->ajustarStock($materialId, $almacenGenerador->id, -$cantidad);
+
+        // Ingress: same material enters the recycler's warehouse
+        $this->anotarMovimiento($contrato->id, $materialId, $almacenReciclador->id,
+            MovimientoStock::TIPO_INGRESO, $cantidad);
+        $this->ajustarStock($materialId, $almacenReciclador->id, $cantidad);
+    });
+}
+```
+
+<Note>
+  The quantity moved is the one **frozen in the contract** (`contrato.cantidad`), not the current lot quantity. This ensures that if the lot was edited between publication and adjudication, the inventory movement always reflects what was actually contracted and paid.
+</Note>
+
+### Warehouse Resolution
+
+The generator's source warehouse is resolved from the lot, not from the company:
+
+```php
+// Uses the warehouse declared on the lot at publication time
+$almacenGenerador = $lote->almacen ?? $this->almacenPrincipal($generador);
+```
+
+This matters when a generator has multiple warehouses: using the company's default warehouse would debit the wrong account. The fallback (`almacenPrincipal()`) applies only to lots created before the `almacen_id` column was added.
+
+For the recycler, the principal warehouse is always used since the recycler does not choose a destination warehouse during the offer flow:
+
+```php
+$almacenReciclador = $this->almacenPrincipal($reciclador);
+```
+
+### Stock Floor at Zero
+
+The `ajustarStock()` private method prevents a stock balance from going negative — a negative physical quantity has no real-world meaning and would indicate a publication without physical backing:
+
+```php
+// app/Services/InventarioService.php
+private function ajustarStock(int $materialId, int $almacenId, float $delta): void
+{
+    // ...lockForUpdate() to serialise concurrent contract completions
+    $nueva = (float) $stock->cantidad + $delta;
+    $stock->cantidad = max(0, $nueva);
+    $stock->save();
+}
+```
+
+### Auto-Create Warehouse
+
+If a company registers without a warehouse, `almacenPrincipal()` creates one on the fly using the company's city as a location reference:
+
+```php
+// app/Services/InventarioService.php
+public function almacenPrincipal(Empresa $empresa): Almacen
+{
+    return Almacen::firstOrCreate(
+        ['empresa_id' => $empresa->id],
+        [
+            'nombre'    => 'Almacen principal',
+            'direccion' => $empresa->ciudad?->nombre ?? 'No especificado',
+            'ciudad_id' => $empresa->ciudad_id,
+            'lat'       => $empresa->ciudad?->lat,
+            'lng'       => $empresa->ciudad?->lng,
+        ]
+    );
+}
+```
+
+## Low-Stock Alerts — `UmbralGeneradorService`
+
+Generators can configure a stock threshold per material. The `UmbralGeneradorService` evaluates the threshold condition and the `UmbralGeneradorWidget` in the Generador panel displays the alert banner when the current stock falls below the configured level.
+
+When the threshold is crossed, `UmbralGeneradorNotification` is dispatched to all users belonging to the generator's company. The alert scheduler runs via the `AlertarUmbralGenerador` Artisan command, executed by Laravel Scheduler.
+
+<Tip>
+  The threshold widget appears on the Generador panel dashboard. It reads live stock from the `stocks` table and compares against the configured `umbral` (threshold) value per material per warehouse. No caching — the check is always against current data.
+</Tip>
+
+## Contract Completion and Inventory Finalisation
+
+The full delivery circuit (managed by `RetiroService`) closes with `confirmarRecepcion()`, which transitions the contract from `activo` to `completado`. At this point the inventory movement has already been recorded (on contract activation). The `completado` transition triggers the `ContratoObserver`, which re-checks document completeness and emits any missing certifications.
+
+The sequence from payment to completion:
+
+<Steps>
+  <Step title="Payment confirmed">
+    Contract → `activo`. `InventarioService::registrarPorContrato()` runs. Egress and ingress movements recorded.
+  </Step>
+  <Step title="Generator declares delivery">
+    `RetiroService::registrarEntrega()` — invoice number and optional shipping note registered on the constancia.
+  </Step>
+  <Step title="Recycler confirms pickup">
+    `RetiroService::confirmarRetiro()` — material has left the generator's premises.
+  </Step>
+  <Step title="Recycler confirms reception">
+    `RetiroService::confirmarRecepcion()` — material received at recycler's plant. Contract → `completado`. Constancia → `confirmada`. Final PDF re-emitted.
+  </Step>
+</Steps>

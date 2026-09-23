@@ -1,0 +1,262 @@
+---
+title: "Configuration Reference: Environment Variables"
+sidebarTitle: "Configuration"
+description: "Complete reference for all environment variables in ExcedentMarket's root .env and web/.env, grouped by category with types and production guidance."
+---
+
+ExcedentMarket uses **two separate `.env` files**: the root `.env` consumed by Docker Compose, and `web/.env` consumed by the Laravel application inside the container. Variables in the root file configure the Compose project (image targets, port mappings, database container credentials); variables in `web/.env` configure the application runtime (session, mail, payment gateways, OCR). On a clean clone neither file exists — the entrypoint derives `web/.env` from `web/.env.example` automatically at first boot.
+
+<Note>
+  Variables in the root `.env` must be written **without quotes**. Docker Compose passes values as-is, so `DB_HOST="database"` would inject the literal string `"database"` (with quotes) into the container, breaking hostname resolution.
+</Note>
+
+## Build & Runtime
+
+These variables are read by Docker Compose to determine how to build and start the containers.
+
+<ParamField body="BUILD_TARGET" type="string" required>
+  Selects the Dockerfile target. `dev` includes Node.js, npm dev dependencies, and OPcache set to revalidate file timestamps. `prod` strips Node, omits dev Composer packages, and freezes OPcache. The image is tagged with this value so `dev` and `prod` images never collide under the same name.
+
+  **Values:** `dev` | `prod` — **Default:** `dev`
+</ParamField>
+
+<ParamField body="APP_ENV" type="string" required>
+  Runtime environment. Passed into the container and read by both the entrypoint and Laravel. Controls whether destructive operations are allowed, whether Vite HMR starts, whether caches are built at startup, and whether a missing `APP_KEY` is fatal.
+
+  **Values:** `local` | `development` | `staging` | `production` — **Default:** `local`
+</ParamField>
+
+<ParamField body="PROJECT_NAME" type="string">
+  Prefix for container names and Docker image tags. The Compose project name is hardcoded to `marketplace-b2b` (in `compose.yml`) to protect volume names from changing if the directory is renamed. This variable only affects image and container naming.
+
+  **Default:** `excedentmarket-2025`
+</ParamField>
+
+<ParamField body="MANTENER_DATOS" type="boolean">
+  When `true`, `App\Support\PoliticaDeBorrado` blocks all destructive migration operations even with `APP_ENV=local`. Use this when the local database contains demo or real data that must not be wiped. In `staging` and `production`, destructive operations are always blocked regardless of this flag.
+
+  **Default:** `false`
+</ParamField>
+
+---
+
+## Application
+
+These variables live in `web/.env` and configure the Laravel application core.
+
+<ParamField body="APP_NAME" type="string">
+  Human-readable application name. Appears in email subjects, browser titles, and Filament panel headers.
+
+  **Default:** `ExcedentMarket`
+</ParamField>
+
+<ParamField body="APP_KEY" type="string" required>
+  Base64-encoded 32-byte encryption key. Required for session encryption, cookie signing, and all `Crypt::` calls. In non-production environments the entrypoint generates and persists this automatically. In production it **must** be set explicitly — the entrypoint exits with an error if it is missing.
+
+  Generate with: `docker compose run --rm web php artisan key:generate --show`
+</ParamField>
+
+<ParamField body="APP_DEBUG" type="boolean">
+  When `true`, full exception stack traces are rendered in the browser and returned in API responses. Must be `false` in `staging` and `production`.
+
+  **Default:** `true`
+</ParamField>
+
+<ParamField body="APP_URL" type="string" required>
+  Full public URL of the application, including scheme and port. Used to build absolute URLs in emails, notifications, and the Vite asset manifest. If set to `https://`, the entrypoint skips the Vite dev server (to avoid mixed-content blocks) and serves the pre-built assets instead.
+
+  **Default:** `http://localhost:2019`
+</ParamField>
+
+<ParamField body="APP_TIMEZONE" type="string">
+  IANA timezone identifier applied to both PHP and the PostgreSQL session. A single value for both prevents timestamp drift between the application layer and the database. Must match the operational timezone of the business.
+
+  **Default:** `America/Asuncion`
+</ParamField>
+
+<ParamField body="APP_LOCALE" type="string">
+  Primary locale for Laravel's translation layer, date formatting helpers, and Faker. All user-facing strings in ExcedentMarket are in Spanish.
+
+  **Default:** `es`
+</ParamField>
+
+---
+
+## Database
+
+<ParamField body="DB_CONNECTION" type="string" required>
+  Laravel database driver. Must be `pgsql` (PostgreSQL 16). SQLite is used **only** inside the test suite via `phpunit.xml` overrides — it is never the runtime driver.
+
+  **Default:** `pgsql`
+</ParamField>
+
+<ParamField body="DB_HOST" type="string" required>
+  Hostname of the PostgreSQL container as seen from the application container. In Docker Compose this is the service name.
+
+  **Default:** `database`
+</ParamField>
+
+<ParamField body="DB_PORT" type="string">
+  PostgreSQL port inside the Docker network. The port published to the host is controlled separately by `DB_DOCKER_PORT` in the root `.env`.
+
+  **Default:** `5432`
+</ParamField>
+
+<ParamField body="DB_DATABASE" type="string" required>
+  PostgreSQL database name. Must match the `POSTGRES_DB` environment variable on the `database` service.
+
+  **Default:** `excedentmarket`
+</ParamField>
+
+<ParamField body="DB_USERNAME" type="string" required>
+  PostgreSQL user. Must match `POSTGRES_USER` on the database service.
+
+  **Default:** `postgres`
+</ParamField>
+
+<ParamField body="DB_PASSWORD" type="string" required>
+  PostgreSQL password. Must match `POSTGRES_PASSWORD` on the database service. Defined in the root `.env` and mirrored in `web/.env` — both must stay in sync.
+
+  **Default:** `secret`
+</ParamField>
+
+<ParamField body="DB_DOCKER_PORT" type="integer">
+  Host port to which PostgreSQL's port 5432 is published. Allows local GUI tools (TablePlus, DataGrip) to connect directly. Does not affect in-container connectivity.
+
+  **Default:** `5432`
+</ParamField>
+
+---
+
+## Session & Cookies
+
+<ParamField body="SESSION_DRIVER" type="string">
+  Storage backend for session data. `database` persists sessions in the `sessions` table and survives container restarts. This is the correct value for multi-container deployments where the `queue` and `scheduler` containers share the same database.
+
+  **Default:** `database`
+</ParamField>
+
+<ParamField body="SESSION_LIFETIME" type="integer">
+  Session lifetime in minutes. After this period of inactivity the session is invalidated.
+
+  **Default:** `120`
+</ParamField>
+
+<ParamField body="SESSION_ENCRYPT" type="boolean">
+  When `true`, the session payload is encrypted before being stored. Adds a layer of protection for database sessions but requires `APP_KEY` to be stable.
+
+  **Default:** `false`
+</ParamField>
+
+<ParamField body="SESSION_SECURE_COOKIE" type="boolean">
+  When `true`, the session cookie is only sent over HTTPS. Left empty in development because HTTP is the default there — setting it to `true` would cause the browser to silently discard the cookie, breaking login with no obvious error message.
+
+  **Production value:** `true`
+</ParamField>
+
+<ParamField body="SESSION_SAME_SITE" type="string">
+  `SameSite` attribute of the session cookie. Must be `lax` (not `strict`) because the payment flow returns the user from `pagopar.com` via a top-level navigation — a `strict` cookie would not be sent on that redirect, logging the buyer out immediately after payment.
+
+  **Default:** `lax`
+</ParamField>
+
+---
+
+## Mail
+
+<ParamField body="MAIL_MAILER" type="string" required>
+  The mail transport driver. `smtp` sends via the Mailpit container in development. In production, change this to the provider's driver (e.g. `smtp` with real credentials, or a provider-specific driver).
+
+  **Default:** `smtp`
+</ParamField>
+
+<ParamField body="MAIL_HOST" type="string" required>
+  SMTP server hostname. In development, `mail` is the Mailpit service name inside the Docker network. In production, replace with your actual SMTP relay.
+
+  **Default:** `mail`
+</ParamField>
+
+<ParamField body="MAIL_PORT" type="integer" required>
+  SMTP port. Mailpit listens on port `1025` inside the Docker network (this port is **not** published to the host to avoid creating an open relay on the LAN). Production providers typically use `587` (STARTTLS) or `465` (SSL).
+
+  **Default:** `1025`
+</ParamField>
+
+<ParamField body="MAIL_UI_PORT" type="integer">
+  Host port for Mailpit's web interface, where all captured outgoing emails are viewable. The default `8025` is common and may already be in use; override it here.
+
+  **Default:** `8025`
+</ParamField>
+
+---
+
+## Services
+
+### Pagopar (Payment Gateway)
+
+<ParamField body="PAGOPAR_MODO" type="string" required>
+  Payment mode. `simulado` uses the platform's internal checkout screen and makes no external network requests — safe for development and testing. `real` requires both keys to be present and will fail loudly if either is missing.
+
+  **Values:** `simulado` | `real` — **Default:** `simulado`
+</ParamField>
+
+<ParamField body="PAGOPAR_PUBLIC_KEY" type="string">
+  Public API key issued by Pagopar. Required only when `PAGOPAR_MODO=real`. The test suite forces `PAGOPAR_MODO=simulado` and clears both keys via `phpunit.xml` to prevent accidental outbound calls.
+</ParamField>
+
+<ParamField body="PAGOPAR_PRIVATE_KEY" type="string">
+  Private API key used to sign Pagopar requests. Required only when `PAGOPAR_MODO=real`. Keep out of version control.
+</ParamField>
+
+<ParamField body="PAGOPAR_API_URL" type="string">
+  Pagopar REST API base URL.
+
+  **Default:** `https://api.pagopar.com`
+</ParamField>
+
+<ParamField body="PAGOPAR_CHECKOUT_URL" type="string">
+  Pagopar hosted checkout page URL. The buyer is redirected here to complete payment.
+
+  **Default:** `https://www.pagopar.com/pagos`
+</ParamField>
+
+<ParamField body="PAGOPAR_WEBHOOK_URL" type="string">
+  Public URL that Pagopar calls with payment status updates. Must be reachable from the internet; in local development use a tunnel (e.g. Cloudflare Tunnel, ngrok).
+</ParamField>
+
+<ParamField body="PAGOPAR_RETURN_URL" type="string">
+  URL to which the buyer is redirected after completing or cancelling payment on the Pagopar checkout page.
+</ParamField>
+
+### OCR (Optical Character Recognition)
+
+ExcedentMarket performs local OCR on uploaded environmental license PDFs using Tesseract. No documents leave the server.
+
+<ParamField body="OCR_IDIOMA" type="string">
+  Tesseract language pack. The `tesseract-ocr-spa` package is pre-installed in the image.
+
+  **Default:** `spa`
+</ParamField>
+
+<ParamField body="OCR_DPI" type="integer">
+  DPI resolution for rendering scanned PDF pages before passing them to Tesseract. Higher values improve recognition accuracy on low-quality scans but increase processing time.
+
+  **Default:** `300`
+</ParamField>
+
+<ParamField body="OCR_PAGINAS_MAX" type="integer">
+  Maximum number of pages to process per document. Caps processing time for multi-page permit dossiers.
+
+  **Default:** `6`
+</ParamField>
+
+---
+
+## Ports
+
+| Variable | Default | Description |
+|---|---|---|
+| `WEB_PORT` | `2019` | Host port for the Apache container. Access the app at `http://localhost:${WEB_PORT}`. |
+| `VITE_PORT` | `5173` | Vite HMR dev server port. Read by both `compose.yml` (port binding) and `vite.config.ts` (server config) from the same variable, eliminating dual sources of truth. Dev target only. |
+| `VITE_HMR_HOST` | `localhost` | The hostname the browser's HMR WebSocket client connects to. Change to the machine's LAN IP when working from another device on the same network. |
+| `ADMINER_PORT` | `2020` | Host port for Adminer's web UI. Only active with `--profile tools`. |

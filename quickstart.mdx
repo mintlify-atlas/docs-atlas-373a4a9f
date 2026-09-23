@@ -1,47 +1,185 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "ExcedentMarket Quickstart: Up and Running with Docker"
+sidebarTitle: "Quickstart"
+description: "Clone the repo, run one Docker Compose command, and have ExcedentMarket fully running with seeded test users in under five minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+Everything ExcedentMarket needs — PHP, Apache, PostgreSQL, Mailpit, the queue worker, and the task scheduler — is defined in a single `compose.yml` at the repository root. The `entrypoint.sh` handles every first-run concern automatically: it derives `.env` from the example file, generates and persists an `APP_KEY`, runs all migrations, generates Filament Shield permissions, and seeds the database with test users. You do not need to run any of these steps manually.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Warning>
+The seed credentials listed in this guide are **for development only**. They are created automatically on the first run of a clean clone. They must never exist in a production deployment. Run `docker compose down -v && docker compose up -d --build` to wipe all data and start fresh at any time.
+</Warning>
 
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+## Setup
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  ### Clone the repository
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+  Clone from the root of the repository. All Docker Compose commands must be run from this directory — **not** from the `web/` subdirectory.
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+  ```bash
+  git clone https://github.com/yosoymitxel/marketplace-tesis-b2b-economia-circular.git
+  cd marketplace-tesis-b2b-economia-circular
+  ```
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
+  ### Start all services
+
+  Build the image and bring up all services in detached mode with a single command:
+
+  ```bash
+  docker compose up -d --build
+  ```
+
+  On the first run, `entrypoint.sh` executes the following sequence automatically before Apache starts:
+
+  1. Copies `web/.env.example` → `web/.env` (the file is in `.gitignore` and won't exist on a clean clone).
+  2. Generates an `APP_KEY` and persists it in the `app_state` volume so it survives container rebuilds — a rotating key would invalidate all sessions and encrypted data.
+  3. Runs `php artisan migrate --force`.
+  4. Detects a first install by counting rows in the `users` table (not a file marker — so recreating only the database volume correctly triggers re-seeding).
+  5. Runs `shield:generate --all --panel=admin` to define the full permission set, then `permission:cache-reset`, then `db:seed`. This order is mandatory: seeding before generating permissions causes a `duplicate key ... role_has_permissions` error.
+  6. Publishes Filament assets, clears caches, and creates the storage symlink.
+  7. Installs npm dependencies if missing, then starts the Vite HMR dev server on port 5173.
+
+  <Info>
+  The `queue` and `scheduler` services wait for `web` to reach a healthy state before starting. Only `web` runs migrations and seeders; the workers share the same `APP_KEY` via the `app_state` volume so they can decrypt job payloads.
+  </Info>
+
+  ### Access the running services
+
+  Once the health check at `/up` passes, all services are reachable:
+
+  | Service | URL | Notes |
+  |---|---|---|
+  | Application | http://localhost:2019 | Port configurable via `WEB_PORT` in `.env` |
+  | Admin panel | http://localhost:2019/admin | Filament — Admin role |
+  | Generador panel | http://localhost:2019/generador | Filament — Generador role |
+  | Reciclador panel | http://localhost:2019/reciclador | Filament — Reciclador role |
+  | Mailpit inbox | http://localhost:8025 | Captures all outbound email — nothing is delivered externally |
+  | Adminer (DB) | http://localhost:2020 | Requires `--profile tools` — see below |
+  | Vite HMR | http://localhost:5173 | Active only when `APP_ENV=local` |
+
+  Adminer is intentionally behind a Docker Compose profile so it is not exposed by default. To start it:
+
+  ```bash
+  docker compose --profile tools up -d
+  ```
+
+  When prompted by Adminer, use: **Server** `database` · **System** `PostgreSQL` · **Username** and **Password** from your `web/.env` (`postgres` / `secret` by default).
+
+  ### Log in with seed credentials
+
+  The database seeder creates one user per role. Use these credentials to explore each panel:
+
+  | Role | Email | Password | Panel URL |
+  |---|---|---|---|
+  | Admin | admin@excedentmarket.com | admin1234 | http://localhost:2019/admin |
+  | Generador | generador@excedentmarket.com | generador1234 | http://localhost:2019/generador |
+  | Reciclador | reciclador@excedentmarket.com | reciclador1234 | http://localhost:2019/reciclador |
+
+  The unified login at `POST /login` redirects to `/portal`, which dispatches each role to its own panel. Each Filament panel also has its own standalone login page (`/admin/login`, `/generador/login`, `/reciclador/login`). When testing authentication changes, verify all three roles — validation rules differ per role type.
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Development Workflow
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+### Hot file sync with `docker compose watch`
+
+The application code lives **inside the Docker image**, not in a bind mount. Changes on the host are not automatically reflected in the running container. Use `docker compose watch` to enable hot file synchronisation during active development:
+
+```bash
+docker compose watch
+```
+
+The watch configuration in `compose.yml` applies rules in order of specificity:
+
+- `composer.lock` or `package-lock.json` changed → **rebuild** the image (reinstalling dependencies without rebuilding would leave the image lying about its contents).
+- Files under `web/config/` changed → **sync + restart** (config is read at boot; syncing without restarting has no effect).
+- All other `web/` files → **sync** into the container, excluding `vendor/`, `node_modules/`, `storage/`, `bootstrap/cache/`, and `public/build/`.
+
+### View logs
+
+Stream logs from the web service (Apache + Laravel + Vite) in real time:
+
+```bash
+docker compose logs -f web
+```
+
+To read only Laravel application errors:
+
+```bash
+docker compose exec web grep local.ERROR storage/logs/laravel.log | tail -20
+```
+
+### Run Artisan commands
+
+Execute any Artisan command inside the running container:
+
+```bash
+docker compose exec web php artisan <command>
+```
+
+Common commands during development:
+
+```bash
+# Run the test suite in parallel (SQLite, inside the container)
+docker compose exec web php artisan test --parallel
+
+# Lint with Pint (dry-run)
+docker compose exec web composer lint
+
+# Fix linting issues
+docker compose exec web composer lint:fix
+
+# Static analysis with Larastan/PHPStan
+docker compose exec web composer analyse
+
+# Run integration tests against the live stack
+bash scripts/verificar_motor_real.sh
+```
+
+### Fresh reset
+
+To destroy all volumes (database, storage, persisted APP\_KEY, node\_modules) and start completely from scratch:
+
+```bash
+docker compose down -v && docker compose up -d --build
+```
+
+<Warning>
+`docker compose down -v` permanently deletes all named volumes including `pgdata`. All database content, uploaded files, and the persisted `APP_KEY` will be lost. This is intentional for a clean-slate reset.
+</Warning>
+
+## Troubleshooting
+
+<Accordion title="All routes return HTTP 500">
+  The most common cause is `storage/logs/laravel.log` not being writable by the Apache process user (`www-data`). When logging itself fails, Apache returns a generic 500 that masks the real exception.
+
+  Check ownership and read the last errors:
+
+  ```bash
+  docker compose exec web ls -la storage/logs/laravel.log
+  docker compose exec web grep local.ERROR storage/logs/laravel.log | tail -3
+  ```
+
+  The `entrypoint.sh` corrects ownership as a final step on every startup, so if this happens after a clean `up --build` it usually means a mid-run failure left files owned by root. Running `docker compose down -v && docker compose up -d --build` resolves it.
+</Accordion>
+
+<Accordion title="Frontend shows: Cannot read properties of null (reading 'component')">
+  This is an Inertia.js adapter version mismatch. The project uses the Inertia JS adapter v3 (`@inertiajs/react: ^3.5.0`), which reads the initial page data from a `<script type="application/json">` element. Writing a `<div data-page>` attribute by hand is the v2 format and produces this exact error.
+
+  Verify that `config/inertia.php` contains:
+
+  ```php
+  'use_script_element_for_initial_page' => true,
+  ```
+
+  And that the root Blade view uses the `@inertia` directive — not a manually written `<div data-page>`.
+</Accordion>
+
+<Accordion title="My code changes are not reflected in the browser">
+  The project does **not** use bind mounts. Code lives inside the Docker image. There are two ways to get changes into the running container:
+
+  - **For day-to-day edits:** use `docker compose watch`. It syncs changed files into the running container (or triggers a rebuild for lockfile changes) without a full `docker compose up --build`.
+  - **For Dockerfile changes or new dependencies:** run `docker compose up -d --build` to rebuild the image.
+
+  If `docker compose watch` is already running and changes still do not appear, check that the path being edited is not in the `ignore` list in `compose.yml` (e.g., changes inside `vendor/` or `public/build/` are intentionally excluded).
+</Accordion>

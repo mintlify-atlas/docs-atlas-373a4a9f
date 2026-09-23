@@ -1,0 +1,187 @@
+---
+title: "Reciclador Panel: Buying and Processing Waste Materials"
+sidebarTitle: "Reciclador"
+description: "The Reciclador panel lets recycling companies browse surplus lots, submit and track offers, manage contracts, and view their environmental impact metrics."
+---
+
+The **Reciclador** panel serves companies that purchase and valorize industrial waste — the buyer side of ExcedentMarket's circular economy marketplace. A Reciclador browses lots published by generators, submits monetary offers on negotiable lots (or completes direct purchases for fixed-price lots), manages active contracts, and maintains their compliance documents and environmental licenses. The panel is accessible at `/reciclador`; the dedicated login URL is `/reciclador/login`. Reciclador accounts are created through self-registration at `/register`.
+
+## Dashboard widgets
+
+The Reciclador dashboard title is "Mi Panel". Its five widgets are declared explicitly to avoid Filament's automatic discovery duplicating them:
+
+```php
+// web/app/Filament/Reciclador/Pages/Dashboard.php
+public function getWidgets(): array
+{
+    return [
+        Widgets\MisOfertasStatsWidget::class,
+        Widgets\MetricasRecicladorWidget::class,
+        Widgets\MiImpactoMensualChart::class,
+        Widgets\MisOfertasPorEstadoChart::class,
+        Widgets\UltimosLotesWidget::class,
+    ];
+}
+```
+
+<Accordion title="Widget descriptions">
+  | Widget | Purpose |
+  |---|---|
+  | `MisOfertasStatsWidget` | Count of the company's offers by state: pending, accepted, rejected, counter-offered. |
+  | `MetricasRecicladorWidget` | Volume purchased, CO₂ avoided, and total spend — the buyer's equivalent of the generator's environmental metrics. |
+  | `MiImpactoMensualChart` | Monthly chart of waste processed and estimated CO₂ avoided, supporting ODS 12 and ODS 13 reporting. |
+  | `MisOfertasPorEstadoChart` | Distribution of the company's offers across all states, helping prioritize follow-up actions. |
+  | `UltimosLotesWidget` | Recent catalogue additions filtered to the company's declared material categories, so the most relevant new lots surface immediately. |
+</Accordion>
+
+## Resources
+
+The Reciclador panel provides five resources:
+
+<CardGroup cols={2}>
+  <Card title="MarketplaceLoteResource" icon="shopping-bag">
+    **Lotes disponibles** — the in-panel marketplace catalogue. Read-only and filtered to lots in `publicado` or `en_negociacion` state, excluding the company's own lots. Supports rich filtering (category, material, valorization type, department, waste class) and group-by axes. Navigation sort: 10.
+  </Card>
+  <Card title="OfertaResource" icon="currency-dollar">
+    **Mis Ofertas** — all offers submitted by this company, with current state (pending, accepted, rejected, counter-offered, withdrawn). Navigation sort: 20.
+  </Card>
+  <Card title="ContratoResource" icon="document-text">
+    **Contratos** — contracts entered into after an offer is accepted. Includes the `ConstanciaTransmision` tab for the waste transfer certificate.
+  </Card>
+  <Card title="AlmacenResource" icon="building-warehouse">
+    **Almacenes** — the recycler's own warehouses, including stock levels per material managed via `StockRelationManager`.
+  </Card>
+  <Card title="DocumentoCertificacionResource" icon="document-check">
+    **Documentos** — compliance certifications for the recycling company.
+  </Card>
+</CardGroup>
+
+<Note>
+  Unlike the Generador panel, the Reciclador panel does **not** include a `LicenciaEmpresaResource`. Environmental licenses for recyclers are validated by the Admin panel. The recycler must hold a valid license before offers are accepted, but license management itself lives under Admin oversight.
+</Note>
+
+## Browsing the catalogue
+
+`MarketplaceLoteResource` renders a table of all lots currently open to offers. The query excludes any lot published by the authenticated company and includes a pending-offer count so the recycler can see how many competitors have already bid:
+
+```php
+// web/app/Filament/Reciclador/Resources/MarketplaceLoteResource.php
+public static function getEloquentQuery(): Builder
+{
+    return parent::getEloquentQuery()
+        ->with(['material.categoria', 'generador'])
+        ->withCount(['ofertas' => fn ($q) => $q->where('estado', 'pendiente')])
+        ->visibles()
+        ->where('generador_id', '!=', auth()->user()->empresa_id ?? 0);
+}
+```
+
+Lots are visible while in `publicado` **or** `en_negociacion` state. This ensures competing bids remain possible even after the first offer is submitted — a lot does not disappear from the catalogue as soon as negotiations begin.
+
+A company with declared material categories gets a **"Solo mis rubros"** filter enabled by default, so the dashboard shows only relevant lots. The filter can be toggled off at any time.
+
+## Submitting an offer from the panel
+
+For **negotiable** lots, the `hacerOferta` action opens an inline form inside the catalogue table. Only `precio_unitario` carries state — `cantidad` and `total` are read-only computed entries derived server-side to prevent client-side manipulation:
+
+```php
+// web/app/Filament/Reciclador/Resources/MarketplaceLoteResource.php
+Action::make('hacerOferta')
+    ->label('Hacer Oferta')
+    ->form([
+        TextEntry::make('cantidad_del_lote')
+            ->label('Cantidad')
+            ->state(fn ($record): string =>
+                Numeros::medida((float) $record->cantidad, $record->unidad_medida)
+            )
+            ->helperText('La oferta es por el lote completo.'),
+
+        TextInput::make('precio_unitario')
+            ->label('Precio por unidad (PYG)')
+            ->required()
+            ->regex('/^[0-9]+$/')
+            ->integer()
+            ->minValue(1),
+
+        TextEntry::make('total_de_la_oferta')
+            ->label('Total de tu oferta')
+            ->state(fn ($record, Get $get): string =>
+                static::totalParaMostrar($record, $get('precio_unitario'))
+            ),
+
+        Hidden::make('condiciones')
+            ->default(fn ($record): array => OfertaService::condicionesDe($record)),
+
+        Textarea::make('nota')
+            ->label('Nota al vendedor (opcional)')
+            ->maxLength(500)
+            ->rows(3),
+    ])
+```
+
+A `Hidden` field snapshots the lot's current commercial conditions at submission time (FR-044). If conditions changed between page load and form submission, `OfertaService` rejects the offer with an `OfertaRechazadaException`.
+
+For **fixed-price** lots, the panel shows a **Comprar** button that opens the public marketplace lot page in a new tab. Payment is handled by the Inertia frontend (PagoPar / DLocalGo integration), not the Filament panel.
+
+## Submitting and withdrawing offers via the web routes
+
+Offers can also be created and withdrawn from the public marketplace page, outside the Filament panel. Both routes require an authenticated session and are rate-limited by the `operaciones` throttle:
+
+```php
+// web/routes/web.php
+
+// Submit a new offer on a lot:
+Route::post('/portal/marketplace/ofertas/{lote}', [OfertaController::class, 'store'])
+    ->middleware('throttle:operaciones')
+    ->name('oferta.store');
+
+// Withdraw an existing offer:
+Route::delete('/portal/marketplace/ofertas/{oferta}', [OfertaController::class, 'retirar'])
+    ->middleware('throttle:operaciones')
+    ->name('oferta.retirar');
+```
+
+Withdrawing an offer sets its state to `retirada` and is visible in `OfertaResource` under **Mis Ofertas**.
+
+## Offer eligibility guard
+
+Before an offer can be submitted — whether from the panel or the public page — the system checks two conditions in order:
+
+```php
+// web/app/Filament/Reciclador/Resources/MarketplaceLoteResource.php
+protected static function motivoNoPuedeOfertar(Model $record): ?string
+{
+    $empresa = auth()->user()?->empresa;
+
+    if ($empresa === null) {
+        return 'Tu usuario no tiene una empresa asociada.';
+    }
+
+    // 1. Environmental license check (RF-NEG-12)
+    $motivoLicencia = $empresa->motivoBloqueoOferta();
+    if ($motivoLicencia !== null) {
+        return 'Tu empresa no puede ofertar: ' . $motivoLicencia;
+    }
+
+    // 2. Duplicate active offer check (RF-NEG-11)
+    $tieneOfertaActiva = Oferta::deEmpresaEnLote((int) $empresa->id, (int) $record->id)
+        ->activas()
+        ->exists();
+
+    return $tieneOfertaActiva
+        ? 'Ya tenes una oferta activa en este lote'
+        : null;
+}
+```
+
+<Warning>
+  The license check runs first because it is a company-level blocker that applies to every lot. A recycler with an expired license cannot offer on anything — regardless of whether they already have active offers on specific lots.
+</Warning>
+
+## Additional panel pages
+
+| Page class | Purpose |
+|---|---|
+| `Dashboard` | "Mi Panel" — widget-based home screen. |
+| `Notificaciones` | In-app notifications for offer status changes, contract events, and counter-offers from generators. |
+| `MiPrivacidad` | Personal data preferences and privacy request submission under **Ley N.° 7.593**. |

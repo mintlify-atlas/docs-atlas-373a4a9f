@@ -1,0 +1,177 @@
+---
+title: "Web Routes and API Endpoints Reference"
+sidebarTitle: "Routes"
+description: "Complete route table for ExcedentMarket: public marketplace, guest auth, authenticated portal, offer management, privacy, and payment webhooks."
+---
+
+All HTTP routes for ExcedentMarket are defined in `web/routes/web.php`. The file uses four middleware groups — public (no middleware), `guest`, `auth`, and a bare webhook endpoint — and applies named rate-limit rules to all write operations. Routes that accept dynamic `{id}` segments use `->whereNumber('id')` to prevent path ambiguity and eliminate one class of invalid-type errors that previously produced PostgreSQL 500 responses on public URLs.
+
+---
+
+## Rate Limit Names
+
+Rate limits are **not** defined inside `web.php`. They are registered in `AppServiceProvider::registrarLimitesDePeticiones()` and referenced by name in `->middleware('throttle:…')`. The four names in use:
+
+| Name | Applied to | Purpose |
+|---|---|---|
+| `acceso` | `POST /login` | Brute-force protection on login |
+| `registro` | `POST /register` | Prevent registration spam |
+| `operaciones` | `POST /portal/marketplace/ofertas/{lote}`, `DELETE /portal/marketplace/ofertas/{oferta}` | Rate-limit marketplace writes |
+| `webhook` | `POST /api/pago/webhook` | Protect the payment callback endpoint |
+
+<Note>
+  GET routes for login and registration pages are intentionally **not** throttled. Applying a rate limit to the GET would prevent the user from returning to the form after a rejection.
+</Note>
+
+---
+
+## 1. Public Routes
+
+No middleware. Accessible without authentication. The marketplace, landing page, and document verifier are all public so regulators and potential buyers can browse without accounts.
+
+| Method | Path | Controller | Description |
+|---|---|---|---|
+| `GET` | `/` | `WelcomeController@index` | Landing page with material counters and featured lots |
+| `GET` | `/privacidad` | `PrivacidadController@show` | Privacy policy display page |
+| `GET` | `/marketplace` | `MarketplaceController@index` | Paginated lot catalogue with filters, map, and facets |
+| `GET` | `/marketplace/{id}` | `MarketplaceController@show` | Lot detail page (`whereNumber`) |
+| `GET` | `/marketplace/empresa/{id}` | `MarketplaceController@empresa` | Company profile (generator's catalogue or buyer profile) (`whereNumber`) |
+| `GET` | `/marketplace/nearby/{id}` | `MarketplaceController@nearby` | Redirect to catalogue filtered to lots within 5 km of `{id}` (`whereNumber`) |
+| `GET` | `/verificar/{codigo}` | `VerificacionDocumentoController@show` | Public document verification by ULID code (for regulators / fiscalizadores) |
+| `GET` | `/error/{status?}` | Closure → `Inertia::render('Error')` | Error page for 401, 403, 404, 419, 429, 500, 503, 505 |
+
+<Note>
+  The two-segment routes `/marketplace/empresa/{id}` and `/marketplace/nearby/{id}` are registered **before** `/marketplace/{id}` with `whereNumber`. Without this ordering and constraint, `GET /marketplace/empresa` would match `show()` with `id = 'empresa'` and PostgreSQL would return a 500 on the bigint cast.
+</Note>
+
+### MarketplaceController highlights
+
+`index()` paginates 24 lots per page with server-side filtering (search, category, city, distance, quantity, pricing mode, valorizacion type). Filters are normalised in `filtrosDesde()` — non-numeric IDs return `null` instead of propagating to the query. Map data switches from individual lot markers to city-grouped clusters above 300 results.
+
+`empresa()` serves two different pages depending on company type. Generator companies show their active lot catalogue; buyer companies show their purchasing profile (categories of interest, recent acquisitions) — but only to admins and generators (i.e. potential sellers).
+
+`nearby()` resolves the lot's public coordinates through `Geo::puntoPublico()` (slightly blurred) and redirects to the catalogue with `lat`, `lng`, `radius_km = 5`, and `desde_lote = {id}` to exclude the source lot from its own neighbour results.
+
+---
+
+## 2. Guest-Only Routes
+
+Middleware: `guest`. Redirects authenticated users away from these pages.
+
+| Method | Path | Controller | Throttle | Description |
+|---|---|---|---|---|
+| `GET` | `/login` | `LoginController@create` | — | Login form |
+| `POST` | `/login` | `LoginController@store` | `acceso` | Credential validation and session creation |
+| `GET` | `/register` | `RegisterController@create` | — | Registration form |
+| `POST` | `/register` | `RegisterController@store` | `registro` | Company + user creation via `RegistroService` |
+
+---
+
+## 3. Authenticated Routes
+
+Middleware: `auth`. All routes in this group require a valid session.
+
+| Method | Path | Controller | Throttle | Description |
+|---|---|---|---|---|
+| `POST` | `/logout` | `LoginController@destroy` | — | Session invalidation |
+| `GET` | `/portal` | Closure | — | Role-based redirect: admin → `/admin`, generador → `/generador`, reciclador → `/reciclador` |
+| `GET` | `/portal/contratos/{contrato}/pagar` | `PaymentController@iniciar` | — | Initiate payment for a contract (requires `?pasarela=`) |
+| `POST` | `/portal/marketplace/ofertas/{lote}` | `OfertaController@store` | `operaciones` | Submit an offer on a lot |
+| `DELETE` | `/portal/marketplace/ofertas/{oferta}` | `OfertaController@retirar` | `operaciones` | Withdraw the buyer's own pending offer |
+| `GET` | `/privacidad/descargar/{solicitud}` | `PrivacidadController@descargar` | — | Download ARCO export file (signed URL required) |
+| `GET` | `/privacidad/aceptar` | `PrivacidadController@mostrarAceptacion` | — | Re-consent screen (shown by `VerificarConsentimientoPrivacidad` middleware) |
+| `POST` | `/privacidad/aceptar` | `PrivacidadController@procesarAceptacion` | — | Record updated privacy consent |
+
+### Portal redirect logic
+
+```php
+Route::get('/portal', function () {
+    $user = auth()->user();
+
+    return match (true) {
+        $user->hasRole('admin')      => redirect('/admin'),
+        $user->hasRole('generador')  => redirect('/generador'),
+        $user->hasRole('reciclador') => redirect('/reciclador'),
+        default                       => redirect('/'),
+    };
+})->name('portal');
+```
+
+The user ID and roles are written to the log (but not the email, per Ley N.° 7.593) before the redirect.
+
+### OfertaController behaviour
+
+`store()` validates that the authenticated user has a company, that the company is a buyer (`esCompradora()`), that the environmental licence is not blocked (`motivoBloqueoOferta()`), and that the user does not already have an active offer on the lot. For `fijo`-priced lots, it calls `OfertaService::comprarPrecioFijo()` which creates and immediately accepts the offer, then redirects to `pago.iniciar`. For negotiable lots, it calls `crearOferta()` and flashes a success message.
+
+`retirar()` returns 404 — not 403 — when the offer belongs to a different company. A 403 would confirm that the offer ID exists; IDs are sequential.
+
+### PaymentController@iniciar
+
+```php
+Route::get('/portal/contratos/{contrato}/pagar', [PaymentController::class, 'iniciar'])
+    ->name('pago.iniciar');
+```
+
+Requires `?pasarela=pagopar|dlocalgo|simulado`. Validates that the contract belongs to the authenticated user's company and is in `pendiente_pago`. Checks for an existing non-expired pending `Pago` before creating a new one — if found, redirects to `urlCheckout()` instead of calling `iniciar()` again.
+
+### Privacy download route
+
+```php
+Route::get('/privacidad/descargar/{solicitud}', [PrivacidadController::class, 'descargar'])
+    ->name('privacidad.descargar')
+    ->middleware('signed');
+```
+
+Uses Laravel's signed URL middleware. The download link is generated with a time-limited signature so that only the user who received the link (via notification) can access their ARCO export file.
+
+---
+
+## 4. API / Webhook Routes
+
+No `auth` middleware — payment gateway webhooks arrive server-to-server without user sessions. The throttle middleware prevents replay attacks.
+
+| Method | Path | Controller | Throttle | Description |
+|---|---|---|---|---|
+| `POST` | `/api/pago/webhook` | `PaymentController@webhook` | `webhook` | Receives payment notifications from Pagopar and dLocal Go |
+
+### Webhook processing
+
+```php
+Route::post('/api/pago/webhook', [PaymentController::class, 'webhook'])
+    ->middleware('throttle:webhook')
+    ->name('pago.webhook');
+```
+
+`PaymentController::webhook()` reads `payment_id` from the payload (tries both `payment_id` and `hash_pedido` keys), uses `PaymentGatewayManager::detectarPorPaymentId()` to identify the gateway from the existing `Pago` row, and delegates to `$gateway->procesarWebhook($payload, $firma)`. Returns `200 OK` on success, `422` with an error message on failure.
+
+<Warning>
+  The signature header names differ by gateway: Pagopar embeds the signature in the payload body; dLocal Go sends it in the `V2-HMAC-SHA256` header. The controller passes both headers to the gateway and lets each implementation decide which to use.
+</Warning>
+
+---
+
+## Route Name Reference
+
+All named routes for use with `route()` helper and Inertia links:
+
+| Name | Path |
+|---|---|
+| `welcome` | `GET /` |
+| `privacidad` | `GET /privacidad` |
+| `marketplace.index` | `GET /marketplace` |
+| `marketplace.show` | `GET /marketplace/{id}` |
+| `marketplace.empresa` | `GET /marketplace/empresa/{id}` |
+| `marketplace.nearby` | `GET /marketplace/nearby/{id}` |
+| `documentos.verificar` | `GET /verificar/{codigo}` |
+| `error.show` | `GET /error/{status?}` |
+| `login` | `GET /login` |
+| `register` | `GET /register` |
+| `logout` | `POST /logout` |
+| `portal` | `GET /portal` |
+| `pago.iniciar` | `GET /portal/contratos/{contrato}/pagar` |
+| `oferta.store` | `POST /portal/marketplace/ofertas/{lote}` |
+| `oferta.retirar` | `DELETE /portal/marketplace/ofertas/{oferta}` |
+| `privacidad.descargar` | `GET /privacidad/descargar/{solicitud}` |
+| `privacy.accept` | `GET /privacidad/aceptar` |
+| `privacy.accept.store` | `POST /privacidad/aceptar` |
+| `pago.webhook` | `POST /api/pago/webhook` |

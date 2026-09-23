@@ -1,0 +1,254 @@
+---
+title: "Filament 5 Panel Architecture and Conventions"
+sidebarTitle: "Filament Panels"
+description: "How ExcedentMarket's three Filament 5 panels are structured, the critical page placement rules, permission generation order, and Filament 5 namespace changes."
+---
+
+ExcedentMarket uses Filament 5 with three distinct panels, each serving a different actor in the circular economy marketplace. Understanding how panels, resources, and pages relate to each other — and the specific ordering requirements — prevents the most common setup errors.
+
+---
+
+## Panel Overview
+
+<CardGroup cols={3}>
+  <Card title="Admin Panel" icon="shield-halved">
+    **Path:** `/admin`  
+    **Login:** `/admin/login`  
+    Role: `admin`  
+    Full system management: companies, lots, contracts, licences, payments, SDG metrics, security incidents, and operational commands.
+  </Card>
+  <Card title="Generador Panel" icon="industry">
+    **Path:** `/generador`  
+    **Login:** `/generador/login`  
+    Role: `generador`  
+    Waste generator view: manage lots, monitor offers and negotiations, view contracts, track withdrawal circuit, download documents.
+  </Card>
+  <Card title="Reciclador Panel" icon="recycle">
+    **Path:** `/reciclador`  
+    **Login:** `/reciclador/login`  
+    Role: `reciclador`  
+    Recycler view: browse available lots, manage offers, track purchases, view contracts and constancias, download documents.
+  </Card>
+</CardGroup>
+
+Each panel has its own `PanelProvider` in `app/Providers/Filament/`, its own login URL, and its own colour scheme. Access is controlled by `User::canAccessPanel(Panel $panel)` which checks `$user->hasRole($panel->getId())`.
+
+---
+
+## Filament 5 Namespace Changes
+
+Filament 5 reorganised several namespaces. The most impactful changes for this project:
+
+<Accordion title="Layout components">
+  Layouts are now under `Filament\Schemas\Components\*` rather than the older `Filament\Forms\Components\*` location for certain wrappers. When migrating from Filament 3/4, update import paths for `Section`, `Grid`, `Fieldset`, and similar structural components.
+</Accordion>
+
+<Accordion title="Actions namespace">
+  Table and form actions now share a single `Filament\Actions\*` namespace. Old import paths:
+
+  ```php
+  // Filament 3/4 (old)
+  use Filament\Tables\Actions\Action;
+  use Filament\Tables\Actions\EditAction;
+  ```
+
+  ```php
+  // Filament 5 (new)
+  use Filament\Actions\Action;
+  use Filament\Actions\EditAction;
+  ```
+</Accordion>
+
+<Accordion title="Text column badges">
+  Badge rendering is now a method on the column itself rather than a separate `BadgeColumn`:
+
+  ```php
+  // Filament 5
+  TextColumn::make('estado')
+      ->badge()
+      ->color(fn (string $state): string => match ($state) {
+          'publicado'      => 'success',
+          'en_negociacion' => 'warning',
+          'adjudicado'     => 'info',
+          default          => 'gray',
+      });
+  ```
+</Accordion>
+
+---
+
+## Critical Page Placement Rules
+
+These rules prevent two classes of production errors that are difficult to diagnose: PHP fatals from missing `$resource` properties, and PostgreSQL duplicate-key violations from double permission registration.
+
+### Rule 1: Resource Pages go under the Resource's Pages/ subdirectory
+
+Pages that belong to a resource (list, create, edit, view) **must** be placed in:
+
+```
+app/Filament/<Panel>/Resources/<X>Resource/Pages/
+```
+
+Each such page must declare its resource:
+
+```php
+// app/Filament/Admin/Resources/EmpresaResource/Pages/ListEmpresas.php
+
+class ListEmpresas extends ListRecords
+{
+    protected static string $resource = EmpresaResource::class;
+}
+```
+
+<Warning>
+  **Never** register base vendor classes like `\Filament\Resources\Pages\EditRecord::route()` or `\Filament\Resources\Pages\CreateRecord::route()` directly in `getPages()`. These vendor classes do not declare `protected static string $resource` — PHP will fatal when Filament tries to resolve the resource for routing.
+</Warning>
+
+### Rule 2: Standalone Pages go in the panel's Pages/ directory
+
+Pages that are not attached to a resource (dashboards, custom tool pages, the `ComandosPage`) go in:
+
+```
+app/Filament/<Panel>/Pages/
+```
+
+These are discovered automatically by `discoverPages()`.
+
+<Warning>
+  **Never put resource pages in the standalone `Pages/` directory.** If a resource page (e.g. `EditEmpresa`) ends up in `app/Filament/Admin/Pages/`, `discoverPages()` will register it as a standalone page AND `getPages()` will register it as a resource page. The second registration of the same permission string triggers a PostgreSQL `duplicate key value violates unique constraint "role_has_permissions"` error during seeding.
+</Warning>
+
+### Rule 3: getPages() must point to concrete classes only
+
+```php
+// app/Filament/Admin/Resources/EmpresaResource.php
+
+public static function getPages(): array
+{
+    return [
+        'index'  => Pages\ListEmpresas::route('/'),
+        'create' => Pages\CreateEmpresa::route('/create'),
+        'edit'   => Pages\EditEmpresa::route('/{record}/edit'),
+        'view'   => Pages\ViewEmpresa::route('/{record}'),
+    ];
+}
+```
+
+Every value in this array must be a concrete class defined under `Resources/EmpresaResource/Pages/` with `protected static string $resource = EmpresaResource::class`.
+
+---
+
+## Permission System
+
+ExcedentMarket uses `filament-shield` (Bezhanov's Laravel Permission Shield) on top of `spatie/laravel-permission`.
+
+### How permissions are generated
+
+`shield:generate` introspects every resource registered across all panels and creates permission strings like:
+
+- `view_empresa`
+- `view_any_empresa`
+- `create_empresa`
+- `update_empresa`
+- `delete_empresa`
+- `delete_any_empresa`
+
+These strings are written into the `permissions` table and then assigned to roles by the Shield seeder.
+
+### Critical ordering requirement
+
+```bash
+# CORRECT order
+php artisan shield:generate --all
+php artisan db:seed
+```
+
+```bash
+# WRONG order — will fail
+php artisan db:seed          # Shield seeder tries to assign permissions that don't exist yet
+php artisan shield:generate  # Too late
+```
+
+<Warning>
+  `shield:generate` must run **before** `db:seed`. The role seeders assign permissions by name, and if those strings don't exist in `permissions` yet, the `syncPermissions()` calls either silently skip the assignment or throw a foreign key violation, depending on the Shield version.
+</Warning>
+
+If a new resource is added after initial setup:
+
+```bash
+php artisan shield:generate --resource=NuevoResource
+# Then re-seed or manually assign the new permissions to roles
+```
+
+---
+
+## Auto-discovery vs Manual Registration
+
+Filament discovers pages and resources through two separate mechanisms. Understanding the boundary prevents duplicate registrations.
+
+<CardGroup cols={2}>
+  <Card title="discoverPages()" icon="magnifying-glass">
+    Scans the standalone `app/Filament/<Panel>/Pages/` directory and registers every class it finds as a page route. Does **not** scan resource subdirectories.
+  </Card>
+  <Card title="discoverResources() + getPages()" icon="list">
+    `discoverResources()` finds all resource classes. For each resource, Filament calls `getPages()` to register its sub-pages. Resource pages are **only** registered through this path.
+  </Card>
+</CardGroup>
+
+The invariant to maintain: a class can be registered by either `discoverPages()` **or** `getPages()`, never both.
+
+---
+
+## Panel Configuration Snippet
+
+Each panel provider looks roughly like this:
+
+```php
+// app/Providers/Filament/AdminPanelProvider.php
+
+public function panel(Panel $panel): Panel
+{
+    return $panel
+        ->id('admin')
+        ->path('admin')
+        ->login()
+        ->colors(['primary' => Color::Amber])
+        ->discoverResources(
+            in: app_path('Filament/Admin/Resources'),
+            for: 'App\\Filament\\Admin\\Resources',
+        )
+        ->discoverPages(
+            in: app_path('Filament/Admin/Pages'),
+            for: 'App\\Filament\\Admin\\Pages',
+        )
+        ->discoverWidgets(
+            in: app_path('Filament/Admin/Widgets'),
+            for: 'App\\Filament\\Admin\\Widgets',
+        )
+        ->authMiddleware([Authenticate::class]);
+}
+```
+
+The `discoverPages()` scan path must point to the **standalone pages directory** — `app/Filament/Admin/Pages` — never to the resources tree or any subdirectory under it.
+
+---
+
+## Common Errors and Fixes
+
+<Accordion title="PHP Fatal: Undefined static property $resource">
+  **Cause:** A vendor base class (e.g. `Filament\Resources\Pages\EditRecord`) was registered directly in `getPages()` instead of a project-defined subclass.
+
+  **Fix:** Create a concrete class in `Resources/<X>Resource/Pages/EditX.php` that extends `EditRecord` and declares `protected static string $resource = XResource::class`, then reference that class in `getPages()`.
+</Accordion>
+
+<Accordion title="SQLSTATE[23505]: duplicate key value violates unique constraint role_has_permissions">
+  **Cause:** A resource page class was placed in the standalone `Pages/` directory. `discoverPages()` registered it once, then `getPages()` registered it again, resulting in two permission rows with the same name.
+
+  **Fix:** Move the offending class from `app/Filament/<Panel>/Pages/` to `app/Filament/<Panel>/Resources/<X>Resource/Pages/`. Re-run `shield:generate` and `db:seed`.
+</Accordion>
+
+<Accordion title="Permissions not assigned after seeding">
+  **Cause:** `db:seed` ran before `shield:generate`, so the permission strings did not exist when the role seeder tried to assign them.
+
+  **Fix:** Run `php artisan shield:generate --all` first, then `php artisan db:seed`.
+</Accordion>

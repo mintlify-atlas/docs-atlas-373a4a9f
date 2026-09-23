@@ -1,0 +1,140 @@
+---
+title: "Generador Panel: Managing Waste Lots and Contracts"
+sidebarTitle: "Generador"
+description: "The Generador panel lets industrial waste producers publish surplus lots, track environmental metrics, review incoming offers, and manage contracts end-to-end."
+---
+
+The **Generador** panel is the operational home for industrial companies that produce waste or surplus materials and want to valorize them under the circular economy framework of **Ley N.° 3956/2009**. A Generador creates waste lots, sets pricing and environmental metadata, monitors incoming offers from recyclers, and signs contracts — all from a dedicated Filament 5 panel isolated from the rest of the platform. The panel URL is `/generador`; the direct login page is `/generador/login`.
+
+## Dashboard widgets
+
+When a Generador logs in they land on "Mi Panel" (`title = 'Mi Panel'`), which renders six widgets defined explicitly in `Dashboard::getWidgets()`:
+
+```php
+// web/app/Filament/Generador/Pages/Dashboard.php
+public function getWidgets(): array
+{
+    return [
+        Widgets\MisLotesStatsWidget::class,
+        Widgets\UmbralGeneradorWidget::class,
+        Widgets\MisMetricasAmbientalesWidget::class,
+        Widgets\MiEvolucionMensualChart::class,
+        Widgets\MisLotesPorEstadoChart::class,
+        Widgets\OfertasPendientesWidget::class,
+    ];
+}
+```
+
+<Accordion title="Widget descriptions">
+  | Widget | Purpose |
+  |---|---|
+  | `MisLotesStatsWidget` | Count of lots by key states (published, under negotiation, awarded). |
+  | `UmbralGeneradorWidget` | Regulatory alert: monitors whether total generated waste crosses the *gran generador* threshold of **Decreto N.° 7.391/17**. Appears first because it is a compliance obligation, not a metric. |
+  | `MisMetricasAmbientalesWidget` | Estimated CO₂ avoided and waste valorized by this company, aligned with ODS 12 and ODS 13. |
+  | `MiEvolucionMensualChart` | Monthly evolution of lots published and closed, useful for spotting seasonal patterns. |
+  | `MisLotesPorEstadoChart` | Donut or bar chart of the current lot portfolio by state. |
+  | `OfertasPendientesWidget` | Live count of pending offers waiting for a response, with a direct link to the Offers resource. |
+</Accordion>
+
+<Note>
+  The widget order is intentional. `UmbralGeneradorWidget` sits above environmental metrics because the *gran generador* classification is a legal obligation; failing to track it carries regulatory risk independent of commercial performance.
+</Note>
+
+## Resources
+
+The Generador panel exposes six resources under the **Operación** navigation group:
+
+<CardGroup cols={2}>
+  <Card title="LotePublicadoResource" icon="cube-transparent">
+    **Mis Lotes** — the core of the panel. Create, publish, and manage waste lots. Supports price modes (fixed / negotiable), environmental metadata (waste class, valorization type under ISO 59004), warehouse assignment, geolocation, and photo uploads. Navigation sort: 10.
+  </Card>
+  <Card title="AlmacenResource" icon="building-warehouse">
+    **Almacenes** — manage the company's physical warehouses. Each warehouse stores location data (city, coordinates) used to geo-locate lots. Includes a `StockRelationManager` for inventory levels per material.
+  </Card>
+  <Card title="OfertaResource" icon="currency-dollar">
+    **Mis Ofertas recibidas** — read-only view of offers submitted by recyclers against the company's published lots. The Generador accepts, rejects, or counter-offers from this resource. Navigation sort: 20.
+  </Card>
+  <Card title="ContratoResource" icon="document-text">
+    **Contratos** — view and manage sales contracts that result from accepted offers. Includes a `ConstanciaTransmisionRelationManager` for the waste transfer certificate required by regulation.
+  </Card>
+  <Card title="DocumentoCertificacionResource" icon="document-check">
+    **Documentos** — compliance certifications attached to the company profile or to individual lots.
+  </Card>
+  <Card title="LicenciaEmpresaResource" icon="identification">
+    **Licencias** — environmental operating licenses (Ley N.° 294/93). A Generador cannot publish lots until at least one approved license exists; `motivoBloqueoPublicacion()` enforces this check.
+  </Card>
+</CardGroup>
+
+## Lot lifecycle
+
+Every lot progresses through five states. The order is fixed by the platform; a Generador can move a lot forward (publish, close) but cannot skip states.
+
+```
+borrador → publicado → en_negociacion → adjudicado → cerrado
+```
+
+The state constants live in `LotePublicadoResource::ESTADOS`:
+
+```php
+// web/app/Filament/Generador/Resources/LotePublicadoResource.php
+public const ESTADOS = [
+    'borrador'       => 'Borrador',
+    'publicado'      => 'Publicado',
+    'en_negociacion' => 'En negociación',
+    'adjudicado'     => 'Adjudicado',
+    'cerrado'        => 'Cerrado',
+];
+```
+
+<Steps>
+  <Step title="Borrador">
+    The lot is saved but not visible in the public marketplace. The Generador fills in material type, quantity, price, warehouse, photos, and environmental metadata. A **Publicar** action button becomes active once the company has a valid environmental license and the lot does not declare a hazardous waste class (Clase A).
+  </Step>
+  <Step title="Publicado">
+    The lot is live in the marketplace. Recyclers can browse it, view photos, and submit offers. The Generador can inspect it via **Ver en Marketplace** to confirm how it appears to buyers. Conditions (material, quantity, price) are locked once the first offer is received.
+  </Step>
+  <Step title="En negociación">
+    At least one active offer exists. The Generador can accept, reject, or counter-offer. The lot remains visible to other recyclers so competing bids are possible.
+  </Step>
+  <Step title="Adjudicado">
+    One offer has been accepted and a contract has been generated. The lot is no longer available for new offers. The Generador and the winning Reciclador manage the contract through their respective `ContratoResource`.
+  </Step>
+  <Step title="Cerrado">
+    The contract has been completed and the waste transfer certificate (`ConstanciaTransmision`) has been confirmed. The lot exits the active portfolio. Closed lots appear in analytics but no longer count toward active inventory.
+  </Step>
+</Steps>
+
+<Warning>
+  A lot **cannot be published** if the company's environmental license is expired or pending validation. The same check runs both on the table action button and inside the action handler — so even if a license expires between page load and confirmation, the publish is blocked server-side.
+</Warning>
+
+## Publishing guard logic
+
+The `LotePublicadoResource` exposes a static helper that is reused by the Publish button, its tooltip, and the action handler, ensuring the three never diverge:
+
+```php
+// web/app/Filament/Generador/Resources/LotePublicadoResource.php
+public static function motivoParaNoPublicar(?LotePublicado $record): ?string
+{
+    $empresa = auth()->user()?->empresa;
+
+    if ($empresa === null) {
+        return 'Sin empresa asociada';
+    }
+
+    return $empresa->motivoBloqueoPublicacion()
+        ?? $record?->motivoNoPublicable();
+}
+```
+
+Two distinct checks are composed here: `motivoBloqueoPublicacion()` validates the **company** (valid license, Ley N.° 294/93) and `motivoNoPublicable()` validates the **lot** (non-hazardous material, Ley N.° 3956/2009).
+
+## Additional panel pages
+
+Beyond resources, the Generador panel includes three standalone pages:
+
+| Page class | Purpose |
+|---|---|
+| `Dashboard` | "Mi Panel" — the widget-based home screen described above. |
+| `Notificaciones` | In-app notification inbox for offer updates, contract events, and system alerts. |
+| `MiPrivacidad` | Personal data and privacy preferences under **Ley N.° 7.593**. Allows the user to submit data access or deletion requests. |

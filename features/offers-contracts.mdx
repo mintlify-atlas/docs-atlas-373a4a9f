@@ -1,0 +1,258 @@
+---
+title: "Offer Negotiation and Contract Lifecycle in ExcedentMarket"
+sidebarTitle: "Offers & Contracts"
+description: "Full walkthrough of ExcedentMarket's offer flow: from submission and counter-offers through contract generation, PDF documents, and public verification."
+---
+
+Every commercial transaction in ExcedentMarket starts with an offer and ends with a signed contract backed by legally-traceable documents. The negotiation layer is intentionally minimal — one round of counter-offer per offer — to keep the process auditable and prevent the open-ended back-and-forth that would require a full conversation history. This page documents the offer lifecycle, the state machine that governs lots and offers, the contract document pipeline, and the public verification endpoint used by regulators.
+
+## Offer States
+
+The `EstadoOferta` enum defines all possible offer states:
+
+```php
+// app/Enums/EstadoOferta.php
+enum EstadoOferta: string
+{
+    case Pendiente      = 'pendiente';      // Awaiting generator response
+    case Contrarrestada = 'contrarrestada'; // Generator counter-offered; buyer must respond
+    case Aceptada       = 'aceptada';       // Accepted; contract created
+    case Rechazada      = 'rechazada';      // Rejected by either party
+    case Retirada       = 'retirada';       // Withdrawn by the buyer before resolution
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="ESTADOS_ACTIVOS" icon="bolt">
+    `['pendiente', 'contrarrestada', 'aceptada']` — The offer is still "live" and occupies the buyer's slot on the lot.
+  </Card>
+  <Card title="ESTADOS_EN_NEGOCIACION" icon="arrows-left-right">
+    `['pendiente', 'contrarrestada']` — A conversation is still open. Used by `OfertaService` to decide whether a lot reverts from `en_negociacion` back to `publicado` when its last offer is resolved.
+  </Card>
+</CardGroup>
+
+## Lot State Transitions
+
+A lot progresses through the following states as offers arrive and are resolved:
+
+```text
+borrador → publicado → en_negociacion → adjudicado → cerrado
+```
+
+| State | Meaning |
+|---|---|
+| `borrador` | Draft — not yet in the catalog |
+| `publicado` | In the catalog, accepting offers |
+| `en_negociacion` | At least one pending or counter-offered offer exists |
+| `adjudicado` | An offer was accepted; contract created; lot hidden from catalog |
+| `cerrado` | Manually closed by the generator or admin |
+
+<Note>
+  A lot in `en_negociacion` reverts to `publicado` automatically if its last active offer is withdrawn or rejected. The check runs inside `OfertaService::devolverLoteSiQuedoSinOfertas()`, which counts both `pendiente` and `contrarrestada` offers — a lot with an open counter-offer still has an active negotiation.
+</Note>
+
+## Creating an Offer — `OfertaService::crearOferta()`
+
+Recyclers submit offers via `POST /portal/marketplace/ofertas/{lote}`. The `OfertaService` validates and persists the offer inside a single database transaction:
+
+```php
+// app/Services/OfertaService.php
+public function crearOferta(
+    LotePublicado $lote,
+    int $recicladorId,
+    int $precioUnitario,
+    array $condiciones,
+    CanalOferta $canal,
+): Oferta
+```
+
+<ParamField body="lote" type="LotePublicado" required>
+  The lot being offered on. Must be in `publicado` or `en_negociacion` state.
+</ParamField>
+
+<ParamField body="recicladorId" type="int" required>
+  ID of the recycler's company (`Empresa`). A company cannot offer on its own lot.
+</ParamField>
+
+<ParamField body="precioUnitario" type="int" required>
+  Price per unit in Guaraníes. The system multiplies this by the lot's `cantidad` to compute the total; the buyer never submits a total directly.
+</ParamField>
+
+<ParamField body="condiciones" type="array" required>
+  Snapshot of the lot conditions as displayed in the form at the time of submission. Must contain `cantidad`, `precio_referencia`, and `modalidad`. Used for the CONDICIONES_CAMBIARON guard (see below).
+</ParamField>
+
+<ParamField body="canal" type="CanalOferta" required>
+  Origin of the offer: `marketplace` (public React page) or `panel` (Filament action). Stored for audit purposes.
+</ParamField>
+
+### Optimistic Locking Pattern (FR-045)
+
+The service rereads and locks the lot row before any validation:
+
+```php
+// app/Services/OfertaService.php
+$vigente = LotePublicado::whereKey($lote->getKey())->lockForUpdate()->first();
+
+if ($vigente === null || ! in_array($vigente->estado, ['publicado', 'en_negociacion'], true)) {
+    throw new OfertaRechazadaException('Este lote ya no está disponible...');
+}
+```
+
+This prevents a race condition where two offers arrive simultaneously: the second transaction blocks until the first commits, then reads the updated state and either proceeds or aborts cleanly.
+
+### Condition-Match Guard — `CONDICIONES_CAMBIARON` (FR-044)
+
+Between the moment the form renders and the moment the buyer clicks "Submit", a generator might edit the lot's quantity, price, or pricing mode. The service compares the submitted `$condiciones` snapshot against the locked row:
+
+```php
+// app/Services/OfertaService.php
+public const CONDICIONES_CAMBIARON =
+    'Las condiciones del lote cambiaron. Revisalas antes de ofertar.';
+```
+
+If any of `cantidad`, `precio_referencia`, or `modalidad` differ (compared numerically, not as strings), the offer is rejected with this message and the buyer sees the updated conditions. The comparison uses `round(..., 2)` to handle decimal representation differences (`"1000"`, `"1000.00"`, and `1000` all match).
+
+## Counter-Offer Flow
+
+Generators can respond to a pending offer with a counter-price via `OfertaService::contraofertar()`. The flow is deliberately limited to **one counter-offer per offer**:
+
+<Steps>
+  <Step title="Offer received">
+    Recycler submits offer. Lot transitions to `en_negociacion`. Generator receives `OfertaRecibidaNotification`.
+  </Step>
+  <Step title="Generator counter-offers">
+    Generator proposes a different `precio_unitario_contraoferta`. Offer transitions to `contrarrestada`. Recycler receives `ContraofertaRecibidaNotification`.
+  </Step>
+  <Step title="Recycler responds">
+    The recycler either **accepts** the counter-offer (calls `aceptarOferta()`, creates a contract) or **rejects** it (calls `rechazarContraoferta()`, offer moves to `rechazada`). Generator receives `ContraofertaRespondidaNotification` in either case.
+  </Step>
+</Steps>
+
+<Warning>
+  A `contrarrestada` offer **cannot** be "withdrawn" via `retirarOferta()`. The buyer must explicitly accept or reject the counter-offer. This prevents disguising a rejection as a withdrawal and ensures the audit trail reflects what actually happened.
+</Warning>
+
+## CanalOferta Enum
+
+```php
+// app/Enums/CanalOferta.php
+enum CanalOferta: string
+{
+    case Marketplace = 'marketplace'; // Submitted from the public React page
+    case Panel       = 'panel';       // Submitted from the Filament Reciclador panel
+}
+```
+
+Every offer records which surface produced it. This is the first field checked when investigating mismatched amounts.
+
+## Contract Auto-Generation
+
+When `OfertaService::aceptarOferta()` succeeds, a `Contrato` is created in the same transaction:
+
+```php
+// app/Services/OfertaService.php
+$contrato = Contrato::create([
+    'lote_id'                => $oferta->lote_id,
+    'oferta_id'              => $oferta->getKey(),
+    'reciclador_id'          => $oferta->reciclador_id,
+    'precio_unitario'        => $oferta->precioUnitarioVigente(),
+    'cantidad'               => $oferta->cantidad,
+    'tasa_comision_aplicada' => Contrato::TASA_COMISION,
+    'estado'                 => 'pendiente_pago',
+]);
+
+$lote->update(['estado' => 'adjudicado']);
+```
+
+The `precio_unitario` stored is the **vigente** price — the counter-offer price if one exists, otherwise the original offer price. The platform commission rate (`TASA_COMISION = 0.03`, i.e. 3%) is frozen into `tasa_comision_aplicada` at contract creation time so that a future rate change does not retroactively alter existing contracts.
+
+## Contract States
+
+The `EstadoContrato` enum defines the full lifecycle:
+
+```php
+// app/Enums/EstadoContrato.php
+enum EstadoContrato: string
+{
+    case PendientePago = 'pendiente_pago'; // Awaiting payment
+    case Activo        = 'activo';         // Payment confirmed; delivery in progress
+    case Completado    = 'completado';     // Buyer confirmed reception
+    case Cancelado     = 'cancelado';      // Cancelled before completion
+    case Incumplido    = 'incumplido';     // Marked as non-compliant by admin
+}
+```
+
+<CardGroup cols={3}>
+  <Card title="pendiente_pago" icon="clock">
+    Initial state. Contract exists, buyer must pay via the configured gateway.
+  </Card>
+  <Card title="activo" icon="truck">
+    Payment confirmed. The three-step delivery circuit (Entrega → Retiro → Recepción) is underway via `RetiroService`.
+  </Card>
+  <Card title="completado" icon="circle-check">
+    Buyer confirmed reception in `RetiroService::confirmarRecepcion()`. Inventory egress registered. All documents finalised.
+  </Card>
+</CardGroup>
+
+## Document Generation
+
+Contract documents are generated asynchronously by background jobs and stored as `DocumentoCertificacion` records.
+
+### Jobs
+
+| Job | Trigger | Documents produced |
+|---|---|---|
+| `GenerarContratoJob` | Offer accepted | Contract PDF (`contrato`) + Environmental Certificate (`certificado_ambiental`) + Commission Receipt (`comprobante_pago`) |
+| `GenerarDocumentosContratoJob` | Payment confirmed | Material Receipt (`recibo_material`) + Payment Confirmation (`constancia_pago`) |
+
+All PDFs are rendered via **dompdf** and include a **QR code** (generated with `bacon/bacon-qr-code`) that encodes the document's `codigo_verificacion`. The QR code points to `GET /verificar/{codigo}`.
+
+### ConstanciaService — Transmisión Certificate
+
+The `ConstanciaService` emits the constancia de transmisión (transmission certificate), which is the primary regulatory document. It uses a sequential numbering scheme (`CT-{YEAR}-{NNNNN}`) and is the only document that certifies the full origin-to-destination chain:
+
+```php
+// app/Services/ConstanciaService.php
+public function generarDesdeContrato(Contrato $contrato, array $datos = []): ConstanciaTransmision
+{
+    $numero = ConstanciaTransmision::generarNumero(); // e.g. CT-2026-00007
+    // ...creates ConstanciaTransmision, renders PDF, registers in documentos_certificacion
+}
+```
+
+The constancia is re-rendered after each step of the delivery circuit (`RetiroService`) so that the printed document always reflects the latest registered event (delivery note number, carrier receipt, reception confirmation).
+
+<Note>
+  The constancia PDF is the single source of truth for regulators. `DocumentoService` used to emit a second "manifiesto" document for the same act — that duplication was removed. One event, one document, one verification code.
+</Note>
+
+## Withdrawing an Offer
+
+A buyer can withdraw a `pendiente` offer from the lot detail page:
+
+```http
+DELETE /portal/marketplace/ofertas/{oferta}
+```
+
+This calls `RetiroService` (via `OfertaController::retirar()`) which sets `estado = 'retirada'` and triggers `devolverLoteSiQuedoSinOfertas()`. The route requires authentication and rate-limiting (`throttle:operaciones`).
+
+## Public Document Verification
+
+Any document with a `codigo_verificacion` can be independently verified without authentication — this is designed for MADES inspectors and regulators:
+
+```http
+GET /verificar/{codigo}
+```
+
+```php
+// routes/web.php
+Route::get('/verificar/{codigo}', [VerificacionDocumentoController::class, 'show'])
+    ->name('documentos.verificar');
+```
+
+The endpoint checks that the document's SHA-256 hash matches the stored value, confirming that the file has not been tampered with since issuance.
+
+<Tip>
+  The verification URL is printed in the QR code on every contract document. Scanning the QR takes the inspector directly to this endpoint — no login, no panel access required.
+</Tip>

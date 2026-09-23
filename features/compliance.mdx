@@ -1,0 +1,214 @@
+---
+title: "Compliance, Privacy Rights, and Environmental Reporting"
+sidebarTitle: "Compliance"
+description: "ARCO privacy rights under Ley N.° 7.593/2025, CO₂ savings metrics, ODS indicator tracking, seven-checkpoint traceability index, and security audit logging."
+---
+
+ExcedentMarket is designed to operate within two overlapping compliance frameworks: Paraguay's personal data protection law (Ley N.° 7.593/2025) and the circular economy mandate of Ley N.° 3956/2009. The system operationalises both — enforcing privacy rights through workflow-driven ARCO requests, and measuring environmental impact through CO₂ savings, ODS indicator tracking, and a seven-checkpoint traceability index. This page documents each compliance dimension and the services that implement it.
+
+---
+
+## ARCO Privacy Rights — Ley N.° 7.593/2025
+
+ARCO stands for Acceso, Rectificación, Cancelación, and Oposición — the four data subject rights defined in Paraguay's privacy law. Users exercise these rights through the **MiPrivacidad** page in their panel.
+
+### Request Workflow
+
+<Steps>
+  <Step title="User submits a request">
+    Users navigate to **MiPrivacidad** in their panel and submit an ARCO request by selecting the type (Acceso, Rectificación, Cancelación, or Oposición) and providing any required justification.
+  </Step>
+  <Step title="Admin reviews via SolicitudPrivacidadResource">
+    The request appears in the Filament Admin panel under `SolicitudPrivacidadResource`. The admin can approve or reject the request, optionally adding a resolution note.
+  </Step>
+  <Step title="ProcesarSolicitudPrivacidadJob runs asynchronously">
+    On approval, `ProcesarSolicitudPrivacidadJob` is dispatched to the queue. It executes the appropriate action based on the request type — exporting data or anonymising the account — without blocking the admin's browser.
+  </Step>
+</Steps>
+
+### Data Export — `ExportarDatosPersonalesService`
+
+For **Acceso** (access) requests, the service exports the user's personal data to the private storage disk:
+
+```php
+// app/Services/ExportarDatosPersonalesService.php
+public function exportarJson(User $user): string
+{
+    $data = $this->recopilarDatos($user);
+    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+    $filename = 'privacidad/' . $user->id . '/portabilidad_' . Str::random(32) . '.json';
+    Storage::disk('local')->put($filename, $json);
+    return $filename;
+}
+```
+
+The export package includes the user's personal profile, company association, commercial activity summary (lots published, offers sent, contracts as seller and buyer), and a history of prior privacy requests. A PDF version is also generated via **dompdf** for the formal right-of-access response.
+
+<Warning>
+  All privacy export files are stored on the `local` disk — a private volume shared between the `web` and `queue` containers in Docker Compose. This disk is **never served over HTTP**. Downloads go through a signed URL route (`GET /privacidad/descargar/{solicitud}`) that validates ownership before streaming the file.
+</Warning>
+
+### Account Anonymisation — `AnonimizarUsuarioService`
+
+For **Cancelación** (deletion) requests, the service replaces all personally identifiable fields with non-reversible values (Art. 31, Ley N.° 7.593/2025):
+
+```php
+// app/Services/AnonimizarUsuarioService.php
+public function ejecutar(User $user): void
+{
+    $uuid = Str::uuid()->toString();
+
+    $user->update([
+        'name'     => 'Usuario Anonimizado',
+        'email'    => 'anonimo_' . $uuid . '@eliminado.local',
+        'telefono' => null,
+        'cargo'    => null,
+        'password' => Hash::make(Str::random(32)),
+        'deletion_requested_at' => now(),
+    ]);
+
+    $user->forceFill([
+        'app_authentication_secret'          => null,
+        'app_authentication_recovery_codes'  => null,
+    ])->save();
+}
+```
+
+The linked `Empresa` record is intentionally left intact. Environmental certifications, constancias de transmisión, and ODS metrics are legally required to be preserved — they are not personal data in the sense of Ley N.° 7.593/2025 (Art. 3, numeral 14 limits "titular de datos" to natural persons). Anonymisation removes the person, not the environmental record.
+
+### Privacy Consent and Versioned Policy
+
+The `PoliticaPrivacidad` model stores versioned policy documents. When a new policy version is activated, the `VerificarConsentimientoPrivacidad` middleware intercepts all authenticated requests and redirects users to the consent page:
+
+```http
+GET  /privacidad/aceptar  → PrivacidadController::mostrarAceptacion()
+POST /privacidad/aceptar  → PrivacidadController::procesarAceptacion()
+```
+
+The middleware compares `users.privacy_policy_version` against the current active policy version. A mismatch triggers re-consent before the user can access any protected route.
+
+---
+
+## CO₂ Savings Reporting — `CO2Service`
+
+The `CO2Service` provides three aggregation methods used by dashboards and reports:
+
+```php
+// app/Services/CO2Service.php
+
+// CO₂ saved by a single lot (quantity × emission factor)
+public function calcularAhorroPorLote(LotePublicado $lote): float
+
+// Total CO₂ saved by all completed contracts for one company
+public function calcularAhorroPorEmpresa(Empresa $empresa): float
+
+// Platform-wide total: all completed contracts
+public function calcularAhorroTotal(): float
+```
+
+All three methods delegate to `LotePublicado::co2EvitadoEstimado()`, which is the single definition of the metric across the whole system:
+
+```php
+// app/Models/LotePublicado.php
+public function co2EvitadoEstimado(): float
+{
+    return (float) $this->cantidad * $this->factorEmisionKgCo2();
+}
+```
+
+The emission factor (`factor_kgCO2_por_kg`) comes from `FactorEmision` records linked to each `Material`. If no factor is defined for a material, its contribution is 0 kg — a deliberate conservative default rather than an assumed value.
+
+`calcularAhorroPorEmpresa()` and `calcularAhorroTotal()` count only **completed** contracts (`scopeCompletados()`), so in-progress negotiations do not inflate the figures.
+
+---
+
+## ODS Metrics — `MetricaOds` and `ActualizarMetricasOdsJob`
+
+ExcedentMarket tracks indicators aligned with two United Nations Sustainable Development Goals:
+
+<CardGroup cols={2}>
+  <Card title="SDG 12 — Responsible Consumption" icon="recycle">
+    Tracks volume of industrial surplus diverted from landfill, number of lots traded, and circular economy valuation types (reuse, recycling, recovery, disposal).
+  </Card>
+  <Card title="SDG 13 — Climate Action" icon="leaf">
+    Tracks total CO₂ savings (kg and tonnes) from completed contracts, aggregated across all materials with registered emission factors.
+  </Card>
+</CardGroup>
+
+`ActualizarMetricasOdsJob` runs on a schedule and writes `MetricaOds` records with the latest computed values. These records feed the ODS dashboard in the Admin panel and the publicly shareable impact report.
+
+---
+
+## Traceability Index — `TrazabilidadService`
+
+The traceability index measures the proportion of lots that have a complete documentary chain from creation to final disposal. It is the primary quantitative indicator for the system's trazabilidad dimension.
+
+### Seven Checkpoints
+
+```php
+// app/Services/TrazabilidadService.php
+public const ESLABONES = [
+    1 => 'Alta',        // Lot created with material, quantity, and location
+    2 => 'Publicacion', // Lot exited draft state
+    3 => 'Negociacion', // At least one offer received
+    4 => 'Adjudicacion',// Contract created; lot marked adjudicado
+    5 => 'Pago',        // At least one confirmed payment
+    6 => 'Documento',   // Constancia with sequential number, SHA-256 hash, and verification code
+    7 => 'Destino',     // Constancia confirmed with final destination recorded
+];
+```
+
+A lot has a **complete trace** only when all seven checkpoints are present. The index is computed in a single aggregated query using correlated subqueries — not an N+1 loop — so it scales to thousands of lots:
+
+```php
+// app/Services/TrazabilidadService.php
+public function indiceGlobal(?int $anio = null, ?int $mes = null): array
+{
+    // Returns:
+    // lotes_evaluados, completos, proporcion (%),
+    // adjudicados, proporcion_adjudicados (%),
+    // indice_promedio, faltantes_por_eslabon
+}
+```
+
+### Dual Denominator Design
+
+The service reports two proportions deliberately:
+
+| Proportion | Denominator | What it measures |
+|---|---|---|
+| `proporcion` | All non-draft lots | What fraction of the full catalog achieves complete traceability |
+| `proporcion_adjudicados` | Lots that reached adjudicación | Whether the system completes the chain when a transaction actually occurs |
+
+Reporting only `proporcion` understates the system (most lots never receive an offer — that is a data characteristic, not a documentation failure). Reporting only `proporcion_adjudicados` overstates it (hides the commercial funnel drop-off). Both are published together.
+
+The `TrazabilidadWidget` on the Admin dashboard renders the index in real time. The `detallePorLote()` method exports a row-by-row audit table for research appendices.
+
+<Note>
+  The definition of "complete trace" is frozen in `TrazabilidadService::ESLABONES`. Modifying the checkpoint list after measurements invalidates all previously recorded index values and requires remeasurement.
+</Note>
+
+---
+
+## Audit Log — `AuditLog` and `Auditable` Trait
+
+Every model that uses the `Auditable` trait records a log entry on each state-changing write. The `AuditLog` model stores:
+
+- **Actor**: the authenticated user ID at the time of the operation
+- **Action**: the operation performed (create, update, delete, state transition)
+- **Target**: the model class and ID
+- **Timestamp**: UTC datetime of the operation
+
+The `AuditLogResource` in the Admin panel provides a filterable, read-only view of the full audit trail. The `LimpiarAuditLogsAntiguos` Artisan command handles scheduled purging of records beyond the retention window.
+
+---
+
+## Security Incidents — `IncidenteSeguridad` and `DeteccionIncidentes`
+
+The `DeteccionIncidentes` service monitors for anomalous patterns (e.g. repeated webhook failures, unusual offer volumes, concurrent lock conflicts above threshold). When a pattern is detected, it creates an `IncidenteSeguridad` record and dispatches `IncidenteSeguridadDetectadoNotification` to all admin users.
+
+The `IncidenteSeguridadResource` in the Admin panel allows administrators to review, annotate, and resolve incident records. Every incident carries a severity level, a description of the detected pattern, and a timestamp.
+
+<Info>
+  Security incidents are for operational monitoring, not for ARCO privacy requests. ARCO requests are tracked separately in `SolicitudPrivacidad` and managed through `ProcesarSolicitudPrivacidadJob`.
+</Info>

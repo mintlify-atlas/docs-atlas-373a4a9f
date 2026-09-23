@@ -1,0 +1,769 @@
+---
+title: "Data Models: Entities, Relationships, and Key Fields"
+sidebarTitle: "Models"
+description: "Complete reference for ExcedentMarket's Eloquent models: tables, fillable fields, casts, computed columns, constants, and all Eloquent relationships."
+---
+
+ExcedentMarket's domain is expressed through eleven core Eloquent models that span the full circular-economy cycle — from company registration and material cataloguing, through lot publication and negotiation, to payment, physical handover, and regulatory traceability. Each model below is documented with its database table, purpose, key fields, notable constants and scopes, and all declared relationships. Fields marked as **generated** are computed by PostgreSQL and cannot be assigned directly.
+
+---
+
+## LotePublicado
+
+**Table:** `lotes_publicados` — The central trading entity. A `LotePublicado` is a batch of industrial surplus material that a waste-generator company publishes for sale. It drives the entire negotiation lifecycle: from `borrador` through `en_negociacion` to `adjudicado`, reserving warehouse stock along the way.
+
+<Tabs>
+  <Tab title="Fillable Fields">
+    <ResponseField name="material_id" type="integer" required>
+      Foreign key to `materiales`. Must resolve to a Class-C (commercializable) material.
+    </ResponseField>
+    <ResponseField name="generador_id" type="integer">
+      Foreign key to `empresas` (the seller). Nullable for lots not yet assigned to a company.
+    </ResponseField>
+    <ResponseField name="almacen_id" type="integer">
+      Warehouse from which material will be dispatched. Location columns are auto-derived from this at save time.
+    </ResponseField>
+    <ResponseField name="estado" type="string" required>
+      Lifecycle state. One of `borrador`, `publicado`, `en_negociacion`, `adjudicado`, `cerrado`. See [`EstadoLote`](/reference/enums#estadolote).
+    </ResponseField>
+    <ResponseField name="cantidad" type="decimal(15,2)" required>
+      Quantity offered, in the material's `unidad_medida`. Maximum: `MAXIMO_DECIMAL` (9 999 999 999 999.99).
+    </ResponseField>
+    <ResponseField name="precio_referencia" type="decimal(15,2)">
+      Reference unit price in Guaraníes. Maximum: `MAXIMO_DECIMAL`.
+    </ResponseField>
+    <ResponseField name="modalidad_precio" type="string" required>
+      Pricing modality (e.g., `por_unidad`, `precio_total`).
+    </ResponseField>
+    <ResponseField name="fecha_limite" type="datetime">
+      Offer-acceptance deadline. Cast to `datetime`.
+    </ResponseField>
+    <ResponseField name="clase_residuo" type="string">
+      Lot-level waste class declaration (`A`, `B`, or `C`). Evaluated independently of the material's class by `motivoNoPublicable()`.
+    </ResponseField>
+    <ResponseField name="codigo_residuo_interno" type="string">
+      Optional catalog code for this specific lot. Falls back to `material.codigo_interno` via `codigoResiduo()`.
+    </ResponseField>
+    <ResponseField name="tipo_valorizacion" type="string">
+      Circular-economy valorization type. Auto-inherited from the material on creation if not supplied. One of `reutilizacion`, `remanufactura`, `reciclaje`, `recuperacion`.
+    </ResponseField>
+    <ResponseField name="proceso_valorizacion" type="string">
+      Free-text description of the valorization process.
+    </ResponseField>
+    <ResponseField name="lat / lng" type="decimal(10,8)">
+      Pickup coordinates. Auto-derived from `almacen.lat/lng` unless a custom pickup point is declared.
+    </ResponseField>
+    <ResponseField name="direccion" type="string">
+      Pickup address. Auto-derived from the warehouse; overridable.
+    </ResponseField>
+    <ResponseField name="registrado_siam_at" type="datetime">
+      Date/time the lot was declared to SIAM. The virtual attribute `registrado_siam` returns `true` when this is non-null.
+    </ResponseField>
+  </Tab>
+  <Tab title="Constants & Scopes">
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `ESTADOS_VISIBLES` | `['publicado', 'en_negociacion']` | Lots shown in the public catalogue and counted on the homepage. |
+| `ESTADOS_RESERVAN_STOCK` | `['publicado', 'en_negociacion', 'adjudicado']` | Lots whose `cantidad` is committed in the warehouse (prevents double-publishing). |
+| `ESTADOS_CONGELADOS` | `['adjudicado', 'cerrado']` | States after which commercial conditions cannot be modified. |
+| `CLASE_PELIGROSA` | `'A'` | Same value as `Material::CLASE_PELIGROSA` — shared regulatory source of truth. |
+| `MAXIMO_DECIMAL` | `9999999999999.99` | Derived from `decimal(15,2)` column capacity. |
+
+```php
+// Only lots available for bidding (excludes archived)
+LotePublicado::visibles()->get();
+
+// Committed quantity for a material in a warehouse
+LotePublicado::cantidadComprometida($materialId, $almacenId);
+
+// Reference price range from past published lots (last 6 months)
+LotePublicado::rangoPrecioReferencia($materialId);
+
+// Lots with a catalog code (own or from material)
+LotePublicado::conCodigoResiduo()->get();
+```
+  </Tab>
+  <Tab title="Relationships">
+
+| Method | Type | Target |
+|---|---|---|
+| `material()` | `BelongsTo` | `Material` |
+| `generador()` | `BelongsTo` | `Empresa` (FK: `generador_id`) |
+| `almacen()` | `BelongsTo` | `Almacen` |
+| `ciudad()` | `BelongsTo` | `Ciudad` |
+| `imagenes()` | `HasMany` | `ImagenLote` — ordered: cover image first, then by `id` |
+| `ofertas()` | `HasMany` | `Oferta` (FK: `lote_id`) |
+| `contrato()` | `HasMany` | `Contrato` (FK: `lote_id`) |
+| `constancia()` | `HasOne` | `ConstanciaTransmision` (FK: `lote_id`) |
+
+  </Tab>
+  <Tab title="Business Methods">
+
+```php
+// Why a lot cannot be published (null = publishable)
+$lote->motivoNoPublicable();
+
+// Why commercial conditions are locked (null = editable)
+$lote->motivoBloqueoCondiciones();
+
+// Circular quality score out of 10, with breakdown
+$lote->calificacionCircular();
+// Returns: ['puntaje' => 8.5, 'maximo' => 10.0, 'criterios' => [...]]
+
+// Estimated CO2 avoided (kg) if this lot is valorized
+$lote->co2EvitadoEstimado();
+
+// Total lot value in Guaraníes (cantidad × precio_referencia)
+$lote->precioTotal();
+```
+
+  </Tab>
+</Tabs>
+
+<Note>
+  The `sinGuardaDeLicencia()` static method temporarily disables the RF-NEG-01 license check. It exists exclusively for demo seeders and test factories — any other use is a deliberate bypass of the publishing rule and is visible via `grep`.
+</Note>
+
+---
+
+## Empresa
+
+**Table:** `empresas` — Represents a registered business entity, either a waste generator (`generador`), recycler (`reciclador`), or both (`ambos`). Stores RUC (tax ID), environmental license status, encrypted contact data, and warehouse/lot relationships.
+
+<Tabs>
+  <Tab title="Fillable Fields">
+    <ResponseField name="nombre" type="string" required>
+      Legal company name.
+    </ResponseField>
+    <ResponseField name="ruc" type="string" required>
+      Paraguay tax ID (RUC). Stored in plaintext — used as the DNIT registry cross-reference key.
+    </ResponseField>
+    <ResponseField name="tipo" type="string" required>
+      Role in the marketplace: `generador`, `reciclador`, or `ambos`.
+    </ResponseField>
+    <ResponseField name="estado" type="string">
+      Company account status.
+    </ResponseField>
+    <ResponseField name="logo_url" type="string">
+      Relative path within the `public` disk, or an absolute URL for static assets.
+    </ResponseField>
+    <ResponseField name="telefono" type="string (encrypted)">
+      Contact telephone. Encrypted at rest under Ley N.° 7.593/2025.
+    </ResponseField>
+    <ResponseField name="direccion" type="string (encrypted)">
+      Physical address. Encrypted at rest. `ciudad_id` is stored unencrypted to support geographic marketplace filters.
+    </ResponseField>
+    <ResponseField name="ciudad_id" type="integer">
+      FK to `ciudades`. Left unencrypted to enable geographic filtering.
+    </ResponseField>
+  </Tab>
+  <Tab title="Constants & Scopes">
+
+```php
+// RUC/DNIT validation state labels (8 keys)
+Empresa::ESTADOS_RUC_DNIT;
+// Keys: 'valido_activo', 'valido_suspension_temporal', 'valido_cancelado',
+//       'no_encontrado', 'formato_invalido', 'padron_vacio',
+//       'padron_desactualizado', 'pendiente'
+
+// Companies that can publish lots (generador + ambos)
+Empresa::TIPOS_QUE_VENDEN; // ['generador', 'ambos']
+
+// Companies that can bid on lots (reciclador + ambos)
+Empresa::TIPOS_QUE_COMPRAN; // ['reciclador', 'ambos']
+
+// Scope: generator companies
+Empresa::vendedoras()->get();
+
+// Scope: recycler companies
+Empresa::compradoras()->get();
+
+// Scope: filter by DNIT validation state
+Empresa::conEstadoRuc('valido_activo', 'pendiente')->get();
+```
+
+  </Tab>
+  <Tab title="Relationships">
+
+| Method | Type | Target |
+|---|---|---|
+| `users()` | `HasMany` | `User` |
+| `destinatarios()` | `HasMany` | `User` — excludes users who exercised deletion rights (Ley N.° 7.593 Art. 31) |
+| `almacenes()` | `HasMany` | `Almacen` |
+| `lotesPublicados()` | `HasMany` | `LotePublicado` (FK: `generador_id`) |
+| `licencias()` | `HasMany` | `LicenciaEmpresa` |
+| `ultimaValidacionRuc()` | `HasOne` | `RucValidacion` (latest) |
+| `contratosComoGenerador()` | `HasManyThrough` | `Contrato` via `LotePublicado` |
+| `ofertasComoReciclador()` | `HasMany` | `Oferta` (FK: `reciclador_id`) |
+| `contratosComoReciclador()` | `HasMany` | `Contrato` (FK: `reciclador_id`) |
+| `categoriasInteres()` | `BelongsToMany` | `CategoriaMaterial` via `empresa_categoria_interes` |
+| `valorizacionesInteres()` | `HasMany` | `ValorizacionInteres` |
+
+  </Tab>
+  <Tab title="Publishing Rules">
+
+```php
+// Can this company publish lots? (Ley N.° 294/93 Art. 7)
+$empresa->puedePublicarLotes();          // bool
+$empresa->motivoBloqueoPublicacion();    // ?string
+
+// Can this company bid on lots? (RF-NEG-12, Ley N.° 3956/09 Art. 26)
+$empresa->puedeOfertar();               // bool
+$empresa->motivoBloqueoOferta();        // ?string
+
+// Latest approved environmental license
+$empresa->licenciaAmbiental();          // ?LicenciaEmpresa
+
+// Logo URL or SVG initials avatar
+$empresa->logoUrl();                    // ?string
+$empresa->logoOAvatar();               // string
+```
+
+  </Tab>
+</Tabs>
+
+<Warning>
+  The `tipo` field uses three values — `generador`, `reciclador`, `ambos` — but **`ambos` is not a third role**; it is the union of the other two. Never filter with `where('tipo', 'generador')` alone: always use `whereIn('tipo', Empresa::TIPOS_QUE_VENDEN)` or the `scopeVendedoras()` / `scopeCompradoras()` scopes.
+</Warning>
+
+---
+
+## User
+
+**Table:** `users` — Authenticatable system user. Always belongs to an `Empresa`. Roles are managed by Spatie `HasRoles`. TOTP secret and recovery codes are encrypted. Contact fields (`telefono`, `cargo`) are encrypted under Ley N.° 7.593/2025.
+
+<Tabs>
+  <Tab title="Fields">
+    <ResponseField name="name" type="string" required>
+      Display name. Stored in plaintext (used in the search index).
+    </ResponseField>
+    <ResponseField name="email" type="string" required>
+      Login email. Stored in plaintext — used as the TOTP issuer identifier.
+    </ResponseField>
+    <ResponseField name="password" type="string (hashed)" required>
+      Bcrypt/Argon hash.
+    </ResponseField>
+    <ResponseField name="empresa_id" type="integer">
+      FK to `empresas`. Every operational user belongs to one company.
+    </ResponseField>
+    <ResponseField name="telefono" type="string (encrypted)">
+      Personal phone. Encrypted at rest.
+    </ResponseField>
+    <ResponseField name="cargo" type="string (encrypted)">
+      Job title/position. Encrypted at rest.
+    </ResponseField>
+    <ResponseField name="privacy_accepted_at" type="datetime">
+      Timestamp of privacy policy acceptance.
+    </ResponseField>
+    <ResponseField name="privacy_policy_version" type="string">
+      FK-style reference to `politicas_privacidad` — tracks which version was accepted.
+    </ResponseField>
+    <ResponseField name="deletion_requested_at" type="datetime">
+      Set when the user exercises the right to erasure (Ley N.° 7.593 Art. 31). The row is anonymised but retained as evidence of compliance.
+    </ResponseField>
+    <ResponseField name="app_authentication_secret" type="string (encrypted)">
+      TOTP secret. Encrypted — equivalent in sensitivity to the password.
+    </ResponseField>
+    <ResponseField name="app_authentication_recovery_codes" type="encrypted:array">
+      TOTP recovery codes. Encrypted array.
+    </ResponseField>
+  </Tab>
+  <Tab title="Panel Access">
+
+```php
+// Panel access is role-gated (explicit allowlist, not dynamic)
+public function canAccessPanel(Panel $panel): bool
+{
+    return match ($panel->getId()) {
+        'admin'     => $this->hasRole('admin'),
+        'generador' => $this->hasRole('generador'),
+        'reciclador'=> $this->hasRole('reciclador'),
+        default     => false,
+    };
+}
+```
+
+  </Tab>
+  <Tab title="Relationships">
+
+| Method | Type | Target |
+|---|---|---|
+| `empresa()` | `BelongsTo` | `Empresa` |
+| `solicitudesPrivacidad()` | `HasMany` | `SolicitudPrivacidad` |
+| Spatie roles | via `HasRoles` | `roles`, `permissions` |
+
+  </Tab>
+</Tabs>
+
+---
+
+## Contrato
+
+**Table:** `contratos` — Created when an offer is accepted by a generator. Freezes the agreed unit price, quantity, and applicable commission rate at creation time. `monto_material` and `comision_plataforma` are **PostgreSQL-generated columns** and cannot be written by Eloquent.
+
+<Tabs>
+  <Tab title="Fillable Fields">
+    <ResponseField name="lote_id" type="integer" required>
+      FK to `lotes_publicados`.
+    </ResponseField>
+    <ResponseField name="oferta_id" type="integer" required>
+      FK to `ofertas` — the winning offer that originated this contract.
+    </ResponseField>
+    <ResponseField name="reciclador_id" type="integer" required>
+      FK to `empresas` (the buyer).
+    </ResponseField>
+    <ResponseField name="precio_unitario" type="decimal(15,0)" required>
+      Frozen unit price in Guaraníes.
+    </ResponseField>
+    <ResponseField name="cantidad" type="decimal(15,2)" required>
+      Quantity contracted.
+    </ResponseField>
+    <ResponseField name="tasa_comision_aplicada" type="decimal(6,4)" required>
+      Commission rate frozen at creation. Default: `TASA_COMISION` (0.03 = 3%).
+    </ResponseField>
+    <ResponseField name="estado" type="string" required>
+      See [`EstadoContrato`](/reference/enums#estadocontrato): `pendiente_pago`, `activo`, `completado`, `cancelado`, `incumplido`.
+    </ResponseField>
+    <ResponseField name="pasarela" type="string">
+      Payment gateway used: `pagopar` or `dlocalgo`.
+    </ResponseField>
+  </Tab>
+  <Tab title="Generated Columns">
+    <ResponseField name="monto_material" type="decimal(15,0) — GENERATED">
+      `precio_unitario × cantidad`, rounded to Guaraní. Computed by PostgreSQL. Read-only via Eloquent.
+    </ResponseField>
+    <ResponseField name="comision_plataforma" type="decimal(15,0) — GENERATED">
+      `monto_material × tasa_comision_aplicada`. Computed by PostgreSQL. Read-only via Eloquent.
+    </ResponseField>
+  </Tab>
+  <Tab title="Constants">
+
+```php
+// Platform commission rate (frozen at contract creation)
+Contrato::TASA_COMISION; // 0.03
+
+// Always read the applied rate from the contract — never the constant
+$contrato->tasaComisionAplicada(); // float
+```
+
+  </Tab>
+  <Tab title="Relationships">
+
+| Method | Type | Target |
+|---|---|---|
+| `lote()` | `BelongsTo` | `LotePublicado` |
+| `oferta()` | `BelongsTo` | `Oferta` |
+| `reciclador()` | `BelongsTo` | `Empresa` (FK: `reciclador_id`) |
+| `pagos()` | `HasMany` | `Pago` |
+| `constancia()` | `HasOne` | `ConstanciaTransmision` |
+| `documentos()` | `HasMany` | `DocumentoCertificacion` |
+| `movimientosStock()` | `HasMany` | `MovimientoStock` |
+
+  </Tab>
+</Tabs>
+
+<Info>
+  `fecha_adjudicacion` is a virtual attribute that returns `created_at` — adjudication and contract creation happen in the same database transaction via `OfertaService::aceptarOferta()`.
+</Info>
+
+---
+
+## Oferta
+
+**Table:** `ofertas` — A price proposal submitted by a recycler company on a published lot. Supports a single round of counter-offering by the generator. Three columns (`monto_ofertado`, `monto_contraoferta`, `precio_unitario_vigente`) are **PostgreSQL-generated** and cannot be written by Eloquent.
+
+<Tabs>
+  <Tab title="Fillable Fields">
+    <ResponseField name="lote_id" type="integer" required>
+      FK to `lotes_publicados` (explicit key — not auto-derived from model name).
+    </ResponseField>
+    <ResponseField name="reciclador_id" type="integer" required>
+      FK to `empresas` (the bidding company).
+    </ResponseField>
+    <ResponseField name="precio_unitario_ofertado" type="decimal(15,0)" required>
+      Initial bid price per unit, in Guaraníes.
+    </ResponseField>
+    <ResponseField name="cantidad" type="decimal(15,2)" required>
+      Quantity bid for.
+    </ResponseField>
+    <ResponseField name="precio_unitario_contraoferta" type="decimal(15,0)">
+      Counter-offer unit price proposed by the generator (single round only).
+    </ResponseField>
+    <ResponseField name="contraoferta_at" type="datetime">
+      When the counter-offer was submitted.
+    </ResponseField>
+    <ResponseField name="canal" type="CanalOferta" required>
+      Origin of the offer: `marketplace` (React public UI) or `panel` (Filament Reciclador panel). No database default — each entry point must declare it.
+    </ResponseField>
+    <ResponseField name="estado" type="string" required>
+      See [`EstadoOferta`](/reference/enums#estadooferta).
+    </ResponseField>
+  </Tab>
+  <Tab title="Constants & Scopes">
+
+```php
+// States in which the negotiation is still open for the buyer
+Oferta::ESTADOS_ACTIVOS;        // ['pendiente', 'contrarrestada', 'aceptada']
+
+// States in which the lot is still "in negotiation"
+Oferta::ESTADOS_EN_NEGOCIACION; // ['pendiente', 'contrarrestada']
+
+// Active offers
+Oferta::activas()->get();
+
+// Active offers by a company on a specific lot
+Oferta::deEmpresaEnLote($empresaId, $loteId)->activas()->get();
+```
+
+  </Tab>
+  <Tab title="Business Methods">
+
+```php
+// Current unit price (counter-offer if present, otherwise original bid)
+$oferta->precioUnitarioVigente();  // float
+
+// Amount that would become the contract value
+$oferta->montoVigente();           // float
+
+// Is the ball in the buyer's court?
+$oferta->esperaRespuestaDelComprador(); // bool
+
+// Can the bidder withdraw? (only 'pendiente' offers)
+$oferta->puedeRetirarse();         // bool
+
+// The contract born from this offer (null if lost to a competitor)
+$oferta->contratoPropio();         // ?Contrato
+```
+
+  </Tab>
+  <Tab title="Relationships">
+
+| Method | Type | Target |
+|---|---|---|
+| `lote()` | `BelongsTo` | `LotePublicado` |
+| `reciclador()` | `BelongsTo` | `Empresa` |
+| `contratoDelLote()` | `HasOne` | `Contrato` — the lot's contract (may belong to a competitor) |
+
+  </Tab>
+</Tabs>
+
+---
+
+## Pago
+
+**Table:** `pagos` — Payment record linked to a `Contrato`. Supports two payment gateways: **Pagopar** (Paraguay-native) and **dLocal Go**. Each gateway stores its own set of transaction identifiers and receipt references.
+
+<Tabs>
+  <Tab title="Fillable Fields">
+    <ResponseField name="contrato_id" type="integer" required>
+      FK to `contratos`.
+    </ResponseField>
+    <ResponseField name="monto" type="decimal(15,0)" required>
+      Amount charged, in Guaraníes (no subunit).
+    </ResponseField>
+    <ResponseField name="estado" type="string" required>
+      See [`EstadoPago`](/reference/enums#estadopago): `pendiente`, `pagado`, `fallido`, `reembolsado`.
+    </ResponseField>
+    <ResponseField name="pasarela" type="string">
+      Gateway identifier: `pagopar` or `dlocalgo`.
+    </ResponseField>
+    <ResponseField name="fecha_pago" type="datetime">
+      When payment was credited.
+    </ResponseField>
+    <ResponseField name="pagopar_hash / pagopar_numero_pedido" type="string">
+      Pagopar transaction references.
+    </ResponseField>
+    <ResponseField name="pagopar_forma_pago / pagopar_forma_pago_id" type="string">
+      Pagopar payment method details.
+    </ResponseField>
+    <ResponseField name="pagopar_comprobante" type="string">
+      Pagopar receipt URL or identifier.
+    </ResponseField>
+    <ResponseField name="dlocalgo_payment_id / dlocalgo_order_id" type="string">
+      dLocal Go transaction identifiers.
+    </ResponseField>
+    <ResponseField name="dlocalgo_forma_pago / dlocalgo_forma_pago_id" type="string">
+      dLocal Go payment method details.
+    </ResponseField>
+    <ResponseField name="dlocalgo_comprobante" type="string">
+      dLocal Go receipt reference.
+    </ResponseField>
+  </Tab>
+  <Tab title="Relationships">
+
+| Method | Type | Target |
+|---|---|---|
+| `contrato()` | `BelongsTo` | `Contrato` |
+
+  </Tab>
+</Tabs>
+
+---
+
+## Material
+
+**Table:** `materiales` — Catalogue entry for a waste or surplus material type. Only **active Class-C materials** are commercializable. Provides the suggested valorization type and CO2 emission factor used in the lot's circular score.
+
+<Tabs>
+  <Tab title="Fillable Fields">
+    <ResponseField name="nombre" type="string" required>
+      Material name (e.g., "Polietileno de alta densidad").
+    </ResponseField>
+    <ResponseField name="categoria_id" type="integer" required>
+      FK to `categorias_material`.
+    </ResponseField>
+    <ResponseField name="unidad_medida" type="string" required>
+      See [`UnidadMedida`](/reference/enums#unidadmedida): `kg`, `ton`, `litros`, `unidades`, `m3`.
+    </ResponseField>
+    <ResponseField name="activo" type="boolean" required>
+      Whether the material is available in the catalogue.
+    </ResponseField>
+    <ResponseField name="clase_residuo" type="string" required>
+      Waste class per Decreto N.° 7.391/17: `A`, `B`, or `C`. See [`ClaseResiduo`](/reference/enums#claseresiduo).
+    </ResponseField>
+    <ResponseField name="codigo_interno" type="string">
+      Internal catalogue code. Used as fallback when a lot has no `codigo_residuo_interno`.
+    </ResponseField>
+    <ResponseField name="codigo_ler" type="string">
+      European Waste Catalogue (LER/EWC) code for cross-reference.
+    </ResponseField>
+    <ResponseField name="tipo_valorizacion_sugerido" type="string">
+      Suggested [`TipoValorizacion`](/reference/enums#tipovalorizacion) — auto-inherited by new lots.
+    </ResponseField>
+    <ResponseField name="precio_referencia_min / precio_referencia_max" type="integer">
+      Market price range in Guaraníes per unit. Used by seeders and `precioVerosimil()`.
+    </ResponseField>
+  </Tab>
+  <Tab title="Constants & Scopes">
+
+```php
+// Shared source of truth for Class A value
+Material::CLASE_PELIGROSA; // 'A'
+
+// Positive-criterion scope: active AND clase_residuo = 'C' ONLY
+// An unclassified material does NOT enter the catalogue by default
+Material::comercializable()->get();
+```
+
+  </Tab>
+  <Tab title="Relationships">
+
+| Method | Type | Target |
+|---|---|---|
+| `categoria()` | `BelongsTo` | `CategoriaMaterial` |
+| `factoresEmision()` | `HasMany` | `FactorEmision` — ordered by `id DESC` (most recent first) |
+| `stocks()` | `HasMany` | `Stock` |
+| `lotesPublicados()` | `HasMany` | `LotePublicado` |
+| `movimientosStock()` | `HasMany` | `MovimientoStock` |
+
+  </Tab>
+</Tabs>
+
+<Warning>
+  `scopeComercializable()` is a **positive-criterion rule**: it explicitly requires `clase_residuo = 'C'`. An unclassified material is not sold until someone classifies it. Do not use `!= 'A'` logic — it silently commercializes everything that was never reviewed.
+</Warning>
+
+---
+
+## Almacen
+
+**Table:** `almacenes` — Physical warehouse belonging to an `Empresa`. Tracks geographic coordinates that propagate automatically to all lots that inherit their location from it. Uses the `Archivable` concern.
+
+<ResponseField name="empresa_id" type="integer" required>
+  Owner company FK.
+</ResponseField>
+<ResponseField name="nombre" type="string" required>
+  Warehouse name.
+</ResponseField>
+<ResponseField name="direccion" type="string">
+  Street address.
+</ResponseField>
+<ResponseField name="ciudad_id" type="integer">
+  FK to `ciudades`.
+</ResponseField>
+<ResponseField name="lat / lng" type="decimal(10,8)">
+  Coordinates used by the marketplace Haversine proximity search.
+</ResponseField>
+
+**Relationships:** `empresa()` → `Empresa`, `ciudad()` → `Ciudad`, `stocks()` → `Stock`, `movimientos()` → `MovimientoStock`, `lotesPublicados()` → `LotePublicado`.
+
+<Info>
+  When a warehouse's location columns (`ciudad_id`, `direccion`, `lat`, `lng`) change, the `booted()` hook automatically updates all active lots in states `borrador`, `publicado`, or `en_negociacion` that had inherited their location from that warehouse. Lots with a custom pickup point are left untouched.
+</Info>
+
+---
+
+## Stock
+
+**Table:** `stocks` — Current physical inventory of one `Material` in one `Almacen`. A unique row per (`material_id`, `almacen_id`) pair. `timestamps = false` — `updated_at` is maintained manually by `InventarioService`.
+
+<ResponseField name="material_id" type="integer" required>FK to `materiales`.</ResponseField>
+<ResponseField name="almacen_id" type="integer" required>FK to `almacenes`.</ResponseField>
+<ResponseField name="cantidad" type="decimal(15,2)" required>Current physical balance.</ResponseField>
+
+**Relationships:** `material()` → `Material`, `almacen()` → `Almacen`.
+
+## MovimientoStock
+
+**Table:** `movimientos_stock` — Immutable ledger entry recording a stock change. Three types:
+
+| Constant | Value | Description |
+|---|---|---|
+| `TIPO_INGRESO` | `'ingreso'` | Material enters a warehouse (recycler adjudication). |
+| `TIPO_EGRESO` | `'egreso'` | Material leaves a warehouse (physical pickup by generator). |
+| `TIPO_AJUSTE` | `'ajuste'` | Manual correction with no commercial counterpart. |
+
+**Fillable:** `material_id`, `almacen_id`, `contrato_id`, `tipo`, `cantidad`. The virtual attribute `fecha_movimiento` aliases `created_at`.
+
+**Relationships:** `material()` → `Material`, `almacen()` → `Almacen`, `contrato()` → `Contrato`.
+
+---
+
+## LicenciaEmpresa
+
+**Table:** `licencias_empresa` — Environmental license filed by a company with MADES (Paraguay's environmental ministry). Governs whether the company can publish lots or submit offers. Validity is **derived** from `fecha_firma + intervalo_auditoria_meses`, not stored as a separate date.
+
+<Tabs>
+  <Tab title="Key Fields">
+    <ResponseField name="empresa_id" type="integer" required>FK to `empresas`.</ResponseField>
+    <ResponseField name="archivo_pdf" type="string">Relative storage path for the uploaded PDF.</ResponseField>
+    <ResponseField name="estado_validacion" type="string">
+      `pendiente`, `aprobada`, or `rechazada`. See `ESTADOS_VALIDACION` constant.
+    </ResponseField>
+    <ResponseField name="expediente_siam" type="string">
+      MADES SIAM dossier number. Used for online registry cross-check and chain-of-renewals lookup.
+    </ResponseField>
+    <ResponseField name="fecha_firma" type="date">
+      Date the resolution was signed by MADES. Combined with `intervalo_auditoria_meses` to derive validity.
+    </ResponseField>
+    <ResponseField name="intervalo_auditoria_meses" type="integer">
+      Audit interval in months as declared in the license document (typically 12 or 24).
+    </ResponseField>
+    <ResponseField name="fecha_proxima_auditoria" type="date — GENERATED">
+      `fecha_firma + intervalo_auditoria_meses`. Computed at save by `vigenciaDerivada()` and enforced by a PostgreSQL CHECK constraint. Null means **indeterminate** validity.
+    </ResponseField>
+    <ResponseField name="validada_siam" type="boolean">Whether the SIAM online registry returned a match.</ResponseField>
+    <ResponseField name="siam_resultado" type="string">Latest SIAM verification result. See `RESULTADOS_SIAM` constant.</ResponseField>
+    <ResponseField name="familia_documental" type="FamiliaDocumental">
+      `declaracion`, `resolucion_aa`, or `otro`. See [`FamiliaDocumental`](/reference/enums#familiadocumental).
+    </ResponseField>
+  </Tab>
+  <Tab title="Validity States">
+
+```php
+// Three states, not two
+$licencia->estadoVigencia();
+// Returns: 'vigente' | 'vencida' | 'indeterminada'
+
+// 'indeterminada' means fecha_firma or intervalo_auditoria_meses is missing.
+// It blocks publishing just like 'vencida' — but requires completing the
+// missing field, not renewing the license.
+
+$licencia->estaVigente();          // bool
+$licencia->vigenciaIndeterminada(); // bool
+$licencia->diasParaVencer();        // ?int (negative if overdue)
+$licencia->proximaAVencer();        // bool (within dias_alerta_vencimiento)
+```
+
+  </Tab>
+  <Tab title="Relationships & Scopes">
+
+| Method | Type | Target |
+|---|---|---|
+| `empresa()` | `BelongsTo` | `Empresa` |
+
+```php
+// Scopes for the admin work queue
+LicenciaEmpresa::indeterminadas()->get();
+LicenciaEmpresa::vencidas()->get();
+LicenciaEmpresa::vigentes()->get();
+```
+
+  </Tab>
+</Tabs>
+
+---
+
+## ConstanciaTransmision
+
+**Table:** `constancias_transmision` — Regulatory transfer certificate issued when a contract's payment is confirmed. Records the declarations of both parties on delivery and receipt. Numbers follow the format `CT-YEAR-NNNNN` (e.g., `CT-2026-00001`), generated from a dedicated PostgreSQL sequence (`seq_constancia_transmision`).
+
+<Tabs>
+  <Tab title="Key Fields">
+    <ResponseField name="contrato_id" type="integer" required>FK to `contratos`.</ResponseField>
+    <ResponseField name="lote_id" type="integer" required>FK to `lotes_publicados`.</ResponseField>
+    <ResponseField name="numero_constancia" type="string" required>
+      Sequential unique certificate number. Format: `CT-YEAR-NNNNN`.
+    </ResponseField>
+    <ResponseField name="estado" type="string" required>
+      Circuit state. See `ESTADOS` constant: `emitida`, `en_transito`, `confirmada`.
+    </ResponseField>
+    <ResponseField name="cantidad_retirada" type="decimal(15,2)">Actual quantity picked up.</ResponseField>
+    <ResponseField name="unidad_medida" type="string">Copied from the material at issuance.</ResponseField>
+    <ResponseField name="numero_factura" type="string">Invoice number (format: `NNN-NNN-NNNNNNN`). Mandatory to register delivery.</ResponseField>
+    <ResponseField name="numero_nota_remision" type="string">Dispatch note number (optional).</ResponseField>
+    <ResponseField name="entrega_registrada_at" type="datetime">When the seller declared delivery.</ResponseField>
+    <ResponseField name="retiro_confirmado_at" type="datetime">When the buyer confirmed pickup.</ResponseField>
+    <ResponseField name="fecha_confirmacion" type="datetime">When the buyer confirmed reception at their facility.</ResponseField>
+    <ResponseField name="destino_final" type="string">Composed from the recycler's name, RUC, and city — not free text.</ResponseField>
+    <ResponseField name="kg_co2_evitados" type="decimal(10,4)">CO2 avoided, frozen at issuance.</ResponseField>
+    <ResponseField name="documento_id" type="integer">FK to `documentos_certificacion` — the PDF, SHA-256 hash, and verification QR live there.</ResponseField>
+  </Tab>
+  <Tab title="Circuit States">
+
+| State | Label | Color |
+|---|---|---|
+| `emitida` | Emitida | `warning` |
+| `en_transito` | Retirada · en tránsito | `info` |
+| `confirmada` | Recepción confirmada | `success` |
+
+```php
+// Generate next certificate number (PostgreSQL sequence)
+ConstanciaTransmision::generarNumero(); // "CT-2026-00042"
+
+// Only confirmed constancias count as valorized material
+ConstanciaTransmision::confirmadas()->get();
+
+// Scopes by actor
+ConstanciaTransmision::delGenerador($empresaId)->get();
+ConstanciaTransmision::delReciclador($empresaId)->get();
+```
+
+  </Tab>
+  <Tab title="Circuit Methods">
+
+```php
+// Transition methods (state change only — orchestration is RetiroService's job)
+$constancia->registrarEntrega($numeroFactura, $notaRemision, $destinoFinal);
+$constancia->confirmarRetiro();
+$constancia->confirmarRecepcion();
+
+// Why a step cannot be taken yet (null = allowed)
+$constancia->motivoParaNoRegistrarEntrega();
+$constancia->motivoParaNoConfirmarRetiro();
+$constancia->motivoParaNoConfirmarRecepcion();
+```
+
+  </Tab>
+</Tabs>
+
+<Note>
+  `scopeConfirmadas()` is the single authoritative filter for "valorized material." All environmental metrics — homepage CO2 counter, ODS metrics, and panel widgets — must use this scope. The old literal `where('estado', 'completado')` is obsolete.
+</Note>
+
+---
+
+## AuditLog
+
+**Table:** `audit_logs` — Append-only security and change audit trail. `timestamps = false`; `created_at` is written explicitly by `AuditObserver`. The `user_id` FK is `ON DELETE SET NULL` so deleting a user preserves their audit history.
+
+<ResponseField name="user_id" type="integer (nullable)">Who made the change. Null for scheduled jobs and Artisan commands.</ResponseField>
+<ResponseField name="accion" type="string">Action type. See [`AccionAuditoria`](/reference/enums#accionauditoria).</ResponseField>
+<ResponseField name="tabla_afectada" type="string">Name of the affected table.</ResponseField>
+<ResponseField name="registro_id" type="integer">Primary key of the affected record.</ResponseField>
+<ResponseField name="datos_previos" type="array (JSON)">Attribute values before the change.</ResponseField>
+<ResponseField name="datos_nuevos" type="array (JSON)">Attribute values after the change.</ResponseField>
+<ResponseField name="ip" type="string">Client IP address at the time of the action.</ResponseField>
+
+**Relationship:** `user()` → `User` (nullable `BelongsTo`).

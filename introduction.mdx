@@ -1,0 +1,76 @@
+---
+title: "ExcedentMarket: Paraguay's Industrial Waste Marketplace"
+sidebarTitle: "Introduction"
+description: "ExcedentMarket is a B2B marketplace connecting Paraguayan waste generators and recyclers under the circular economy framework of Ley N.° 3956/2009."
+---
+
+ExcedentMarket is a B2B digital marketplace purpose-built for Paraguay's industrial sector, enabling companies that generate industrial waste and surplus materials to connect directly with certified recyclers and reprocessors. The platform operationalises the circular economy principles established under national law — turning residuals that would otherwise be disposed of into tradeable commodities with transparent pricing, legally binding contracts, and traceable environmental impact.
+
+## Regulatory Context
+
+Paraguay's solid waste management framework is defined by **Ley N.° 3956/2009 — Ley de Gestión Integral de los Residuos Sólidos** and its implementing decree **Decreto N.° 7.391/17**. The law establishes a three-tier classification for industrial waste:
+
+| Class | Name | Description | Platform scope |
+|---|---|---|---|
+| **A** | Peligroso | Hazardous waste requiring special handling, licensed disposal sites, and regulatory traceability | **Excluded** — not commercialised on ExcedentMarket |
+| **B** | Manejo especial | Special-handling waste requiring documented management plans and licensed operators | Supported with enhanced licence checks |
+| **C** | Industrial no peligroso | Non-hazardous industrial waste and surplus materials suitable for direct reuse or recycling | **Primary scope** of the marketplace |
+
+<Note>
+ExcedentMarket focuses on **Class C** industrial waste — the category that presents the greatest opportunity for circular reuse in Paraguay's manufacturing, agro-industrial, and construction sectors. Class A hazardous waste is outside the platform's scope by design and by law.
+</Note>
+
+The platform also integrates with **SIAM** (Sistema de Información Ambiental del MADES — Ministerio del Ambiente y Desarrollo Sostenible) to verify that recycler operators hold valid environmental licences before they can accept or process materials, and validates company tax identity through **RUC/DNIT** (Registro Único del Contribuyente / Dirección Nacional de Ingresos Tributarios).
+
+## User Roles
+
+ExcedentMarket is built around three distinct roles, each with its own Filament panel, authentication flow, and permission scope.
+
+<CardGroup cols={3}>
+  <Card title="Admin" icon="shield-halved">
+    Platform operator. Manages user onboarding and approval, oversees all marketplace activity, configures categories and waste classifications, monitors CO₂ impact metrics, and handles ARCO privacy requests. Accesses the platform at `/admin`.
+  </Card>
+  <Card title="Generador" icon="industry">
+    Industrial waste generator. Publishes listings for surplus materials or waste streams, sets asking prices, receives and counter-offers on recycler bids, signs contracts, and processes payments. Accesses the platform at `/generador`.
+  </Card>
+  <Card title="Reciclador" icon="recycle">
+    Certified recycler or reprocessor. Browses the public marketplace catalogue, submits offers on listings, negotiates terms through the offer/counter-offer flow, signs contracts, and completes purchases. Must hold a valid SIAM/MADES environmental licence. Accesses the platform at `/reciclador`.
+  </Card>
+</CardGroup>
+
+## Platform Capabilities
+
+ExcedentMarket covers the full commercial lifecycle of an industrial waste transaction, from listing to payment, within a single platform.
+
+<CardGroup cols={2}>
+  <Card title="Marketplace Catalogue" icon="store">
+    Searchable, filterable catalogue of available materials by waste class, volume, location, and price. Public listings are visible to all registered recyclers.
+  </Card>
+  <Card title="Offer and Counter-Offer" icon="arrows-left-right">
+    Structured negotiation flow allowing recyclers to submit offers on listings and generators to accept, reject, or counter. Full audit trail of all negotiation events.
+  </Card>
+  <Card title="Contracts" icon="file-signature">
+    Automatically generated PDF contracts based on agreed terms, with QR code verification. Signed contracts are stored and downloadable by both parties.
+  </Card>
+  <Card title="Payments" icon="credit-card">
+    Integrated payment processing via **Pagopar** (Paraguay's leading payment gateway) and **DLocalGo**, with a simulated checkout mode for development and testing.
+  </Card>
+  <Card title="RUC/DNIT Validation" icon="id-card">
+    Automated tax identity validation against the DNIT registry. Monthly automated import of the official DNIT taxpayer roll keeps the local lookup table current.
+  </Card>
+  <Card title="SIAM/MADES Licence Check" icon="certificate">
+    OCR-assisted validation of uploaded environmental licence documents against the SIAM registry, using Tesseract for local document recognition without sending sensitive data to external services.
+  </Card>
+  <Card title="CO₂ Impact Tracking" icon="leaf">
+    Per-transaction CO₂ equivalent savings calculated from material type and volume, aggregated into dashboard metrics for both individual users and platform-level reporting.
+  </Card>
+  <Card title="ARCO Privacy Compliance" icon="lock">
+    Data subject rights management (Access, Rectification, Cancellation, Opposition) in compliance with Paraguay's personal data protection framework. Exports and purges handled via background jobs with private, non-public storage.
+  </Card>
+</CardGroup>
+
+## Academic Context
+
+<Note>
+ExcedentMarket is a **thesis prototype** developed as academic research for the Paraguayan higher education system. It demonstrates the technical and regulatory feasibility of a circular economy marketplace under Ley N.° 3956/2009. The platform is production-grade in architecture and implementation, but it is not currently a live commercial service. All seed data, test credentials, and demonstration company records are fictitious and should never be used in a production deployment.
+</Note>

@@ -1,0 +1,193 @@
+---
+title: "Public Marketplace: Browse and Filter Industrial Waste Lots"
+sidebarTitle: "Marketplace"
+description: "Explore ExcedentMarket's public catalog of industrial waste lots — filterable by material, category, city, and geographic proximity. No login required."
+---
+
+The public marketplace at `/marketplace` is the commercial heart of ExcedentMarket: a fully open catalog of industrial surplus and waste lots that any visitor — authenticated or not — can browse, filter, and explore on an interactive map. Built on Inertia 2 + React 19 with server-side pagination and PostgreSQL full-text search, it is designed to handle the full national catalog without performance degradation, resolving all filters on the server so that shared URLs always reproduce the same results.
+
+## Lot Visibility
+
+Not every lot in the system is visible to the public. The `LotePublicado` model defines a constant that governs which states are considered "open to offers":
+
+```php
+// app/Models/LotePublicado.php
+public const ESTADOS_VISIBLES = ['publicado', 'en_negociacion'];
+```
+
+<CardGroup cols={2}>
+  <Card title="publicado" icon="circle-check">
+    The lot has been published by the generator and is actively accepting offers from recyclers. This is the default entry state for the catalog.
+  </Card>
+  <Card title="en_negociacion" icon="arrows-left-right">
+    At least one offer has been received. The lot remains visible and continues to accept competing offers until one is accepted. Hiding it at this stage would unfairly exclude other buyers.
+  </Card>
+</CardGroup>
+
+<Note>
+  Lots in `adjudicado` (awarded) or `cerrado` (closed) states are hidden from the public catalog. Parties to an existing contract can still access the lot detail page via their panel links.
+</Note>
+
+The `scopeVisibles` query scope applies both filters together — state and soft-delete (`archivado_at`) — so that archived lots disappear from all four surfaces that read the catalog simultaneously:
+
+```php
+// app/Models/LotePublicado.php
+public function scopeVisibles(Builder $query): Builder
+{
+    return $query
+        ->whereIn($this->qualifyColumn('estado'), self::ESTADOS_VISIBLES)
+        ->whereNull($this->qualifyColumn('archivado_at'));
+}
+```
+
+## URL Structure and Routes
+
+All marketplace routes are publicly accessible without authentication:
+
+```php
+// routes/web.php
+Route::get('/marketplace', [MarketplaceController::class, 'index'])
+    ->name('marketplace.index');
+
+Route::get('/marketplace/{id}', [MarketplaceController::class, 'show'])
+    ->whereNumber('id')
+    ->name('marketplace.show');
+
+Route::get('/marketplace/empresa/{id}', [MarketplaceController::class, 'empresa'])
+    ->whereNumber('id')
+    ->name('marketplace.empresa');
+
+Route::get('/marketplace/nearby/{id}', [MarketplaceController::class, 'nearby'])
+    ->whereNumber('id')
+    ->name('marketplace.nearby');
+```
+
+<Tip>
+  The `/marketplace/empresa/{id}` and `/marketplace/nearby/{id}` routes are declared **before** `/{id}` in `web.php` to prevent the wildcard from intercepting them. Without this ordering, `/marketplace/empresa` would match `show()` with `id='empresa'` and return a 500.
+</Tip>
+
+## Search and Filters
+
+The catalog supports rich server-side filtering. All filter parameters live in the URL, which enables sharing searches, browser back-navigation, and accurate server-side pagination.
+
+<Accordion title="search — Material name or company name (ILIKE)">
+  Performs a case-insensitive partial match against the material name and the generator's company name. On PostgreSQL the query uses `ILIKE`; on SQLite (used in tests) it uses `LIKE`, which is already case-insensitive:
+
+  ```php
+  // app/Http/Controllers/MarketplaceController.php
+  private function operadorLike(): string
+  {
+      return DB::connection()->getDriverName() === 'pgsql' ? 'ilike' : 'like';
+  }
+  ```
+
+  The search term is capped at 120 characters (`MAX_LARGO_BUSQUEDA = 120`) to prevent full-table-scan attacks on the unindexed `ILIKE '%...%'` pattern.
+</Accordion>
+
+<Accordion title="categoria — Category filter (multi-select)">
+  Accepts a comma-separated list of category IDs, e.g. `?categoria=3,7`. The controller normalises the list via `listaDeIds()`, discarding any non-integer values so that a malformed ID silently drops the invalid entry rather than triggering a 500.
+</Accordion>
+
+<Accordion title="material — Specific material filter">
+  Filters by exact material IDs. Used by the homepage cards, which link to the catalog pre-filtered to a specific material (e.g. PET, Copper). Sent as `?material=12,45`.
+</Accordion>
+
+<Accordion title="ciudad_id / departamento_id — Geographic zone">
+  If both are present, `ciudad_id` takes precedence. This prevents an unintended AND condition between city and department. Only zones that currently have available lots appear in the selector (`LotePublicado::ubicacionesDisponibles()`).
+</Accordion>
+
+<Accordion title="lat, lng, radius_km — Proximity filter (Haversine)">
+  Filters lots within `radius_km` kilometres of a given coordinate using the Haversine formula via `Geo::expresionHaversine()`. The radius defaults to 10 km and is validated between 0 and 800 km (`MAX_RADIO_KM`). A radius of 0 is accepted intentionally — it is how tests verify that the filter genuinely narrows results.
+</Accordion>
+
+<Accordion title="cantidad_min — Minimum quantity">
+  Applied server-side against `lotes_publicados.cantidad`. Filtering on the client over 24 paginated cards would silently hide qualifying results.
+</Accordion>
+
+<Accordion title="solo_mades — Lots with a waste catalogue code">
+  Shows only lots that have a `codigo_residuo_interno` declared on the lot **or** inherited from their material (`Material::codigo_interno`). Uses `scopeConCodigoResiduo()` to check both paths.
+</Accordion>
+
+## Nearby Lots — `/marketplace/nearby/{id}`
+
+The "nearby" route is a redirect helper. It takes a lot's ID, reads its coordinates, and redirects to the main catalog pre-filtered by a 5 km radius centred on that lot:
+
+```php
+// app/Http/Controllers/MarketplaceController.php
+private const RADIO_CERCANIA_KM = 5;
+private const CANDIDATOS_RELACIONADOS = 50;
+private const RELACIONADOS_MOSTRADOS = 3;
+```
+
+The 5 km radius was chosen deliberately — a 25 km radius over the Gran Asunción data set returns virtually the entire catalogue, making the filter appear to do nothing. Five kilometres is the practical consolidation distance for a single pick-up trip.
+
+The lot detail page itself shows up to **3 related lots** (same material, closest by distance). The controller first fetches up to 50 candidates (`CANDIDATOS_RELACIONADOS`), calculates the Haversine distance for each in PHP, sorts ascending, and takes the 3 closest (`RELACIONADOS_MOSTRADOS`). Lots without coordinates are sorted to the end.
+
+<Note>
+  Geographic coordinates are slightly fuzzed before being sent to the browser (`Geo::puntoPublico()`). The exact pickup address is shared only after a contract is formalised, not on the public catalog.
+</Note>
+
+## Map Rendering
+
+The catalog page passes a `mapa` prop to the React frontend. The map mode switches automatically based on the number of visible lots:
+
+| Total lots in result | Map mode | Description |
+|---|---|---|
+| ≤ 300 (`MAX_PUNTOS_MAPA`) | `lotes` | One Leaflet marker per lot |
+| > 300 | `ciudades` | Grouped cluster pins per city with counts |
+
+This threshold prevents transmitting thousands of full lot objects for the map — a previous version sent 1.8 MB of JSON per request when the full catalogue was loaded unpaginated.
+
+## CO₂ Display on Lot Cards
+
+Every lot card shows an estimated CO₂ saving (`co2_evitado_estimado`). The calculation is defined once in the model and reused everywhere:
+
+```php
+// app/Models/LotePublicado.php
+public function co2EvitadoEstimado(): float
+{
+    return (float) $this->cantidad * $this->factorEmisionKgCo2();
+}
+```
+
+The factor (`factor_kgCO2_por_kg`) comes from the `FactorEmision` records linked to the lot's material. If no factor is loaded, the result is 0 kg.
+
+## Hazardous Waste Exclusion
+
+Lots whose material is classified as **Class A** (peligroso / hazardous) under Ley N.° 3956/2009 are excluded from the catalog. The `scopeVisibles()` scope inherits this exclusion through `Material::scopeComercializable()`, which filters out `clase_residuo = 'A'`.
+
+A lot can also declare its own waste class, and the check runs on both the lot and its material:
+
+```php
+// app/Models/LotePublicado.php
+public const CLASE_PELIGROSA = 'A';
+
+public function motivoNoPublicable(): ?string
+{
+    $claseLote = ClaseResiduo::desde($this->clase_residuo);
+
+    if ($claseLote !== null && ! $claseLote->esComercializable()) {
+        return 'El lote está declarado en la clase «'.$claseLote->etiqueta().'»...';
+    }
+    // ...also checks $this->material->clase_residuo
+}
+```
+
+<Warning>
+  Lots carrying Class A hazardous waste cannot be published. Attempting to publish them via `OfertaService` or the Filament panel will return an explanatory message via `motivoNoPublicable()`.
+</Warning>
+
+## Pagination
+
+The catalog paginates at **24 lots per page** (`POR_PAGINA = 24`). The paginator and all active filters travel as query-string parameters so that `withQueryString()` keeps them across page navigation:
+
+```php
+// app/Http/Controllers/MarketplaceController.php
+$pagina = $this->consultaFiltrada($filtros, conDistancia: true)
+    ->with(['material.categoria', 'material.factoresEmision', 'generador', 'imagenes', 'ciudad.departamento'])
+    ->when(! ($filtros['lat'] && $filtros['lng']), fn ($q) => $q->latest())
+    ->paginate(self::POR_PAGINA)
+    ->withQueryString();
+```
+
+The total count is computed once from the unhydrated query (`->count()`), not from `count($pagina->items())`, so facet counters always reflect the full dataset rather than the current page.

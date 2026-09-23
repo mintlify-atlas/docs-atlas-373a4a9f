@@ -1,0 +1,397 @@
+---
+title: "Background Jobs: Queue Workers and Scheduled Tasks"
+sidebarTitle: "Jobs"
+description: "Reference for all Laravel queue jobs in ExcedentMarket: contract generation, RUC validation, SIAM licence checks, OCR processing, and SDG metrics."
+---
+
+ExcedentMarket offloads every operation that is too slow, too fragile, or too risky to run inside an HTTP request to Laravel's queue system. Jobs are dispatched on business events (offer accepted, privacy request submitted) or triggered by the scheduler (monthly DNIT import, weekly SIAM check). Both the `queue` and `scheduler` Docker Compose services must be healthy for these to run — they both depend on the `web` service being up first.
+
+<Note>
+  The queue worker starts with `queue:work` and no `--queue` flag, so all jobs must use the `default` queue. A named queue would never be processed.
+</Note>
+
+---
+
+## Contract & Document Jobs
+
+<CardGroup cols={2}>
+  <Card title="GenerarContratoJob" icon="file-signature">
+    Emits the written agreement PDF when an offer is accepted.
+  </Card>
+  <Card title="GenerarDocumentosContratoJob" icon="files">
+    Emits the environmental certificate and commission voucher when a contract becomes active.
+  </Card>
+</CardGroup>
+
+### GenerarContratoJob
+
+Dispatched when an offer is accepted (`OfertaService::aceptarOferta()`). Emits the `contrato` document via `DocumentoService::generarContrato()` so the buyer has a written agreement **before** paying.
+
+```php
+// app/Jobs/GenerarContratoJob.php
+class GenerarContratoJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    public function __construct(private Contrato $contrato) {}
+
+    public function handle(DocumentoService $documentos): void
+    {
+        $contrato = $this->contrato->load('lote.material', 'lote.generador', 'reciclador');
+
+        if ($contrato->documentos()->where('tipo', 'contrato')->exists()) {
+            return;
+        }
+
+        $documentos->generarContrato($contrato);
+    }
+
+    public function failed(\Throwable $e): void
+    {
+        Log::error('GenerarContratoJob fallo', [
+            'contrato_id' => $this->contrato->id,
+            'error'       => $e->getMessage(),
+        ]);
+    }
+}
+```
+
+<Tip>
+  The idempotency guard checks by `tipo = 'contrato'` — not "does any document exist" — because the contract coexists with the certificate and the payment receipts, each emitted at a different point in time.
+</Tip>
+
+**Why in the queue and not inside the transaction?** Rendering a PDF with Dompdf inside the `aceptarOferta` transaction would hold a `lockForUpdate()` on rows the marketplace is actively querying for the entire render duration. The job releases the lock immediately and renders afterwards.
+
+---
+
+### GenerarDocumentosContratoJob
+
+Dispatched when a contract transitions to `activo` (post-payment). Emits:
+
+- **Certificado ambiental** — `DocumentoService::generarCertificadoAmbiental()`
+- **Comprobante de comisión** — `DocumentoService::generarComprobanteComision()`
+
+Then notifies all users of both companies via `DocumentacionContratoEmitidaNotification`.
+
+```php
+// app/Jobs/GenerarDocumentosContratoJob.php
+class GenerarDocumentosContratoJob implements ShouldQueue
+{
+    use Queueable;
+
+    public int $tries   = 3;
+    public int $timeout = 120;
+
+    public function __construct(private Contrato $contrato) {}
+
+    public function handle(DocumentoService $documentos): void
+    {
+        $contrato = $this->contrato->load('lote.material', 'lote.generador', 'reciclador');
+
+        $documentos->generarCertificadoAmbiental($contrato);
+        $documentos->generarComprobanteComision($contrato);
+
+        $this->avisarALasPartes($contrato);
+    }
+}
+```
+
+<Warning>
+  Notification failures are swallowed inside `avisarALasPartes()` — a mail delivery error must not cause the job to be marked as failed and re-run with `$tries = 3`, which would duplicate all three documents.
+</Warning>
+
+---
+
+## Validation & Import Jobs
+
+### ImportarPadronDnitJob
+
+Scheduled monthly. Downloads the DNIT RUC registry — published as ten ZIP files, one per initial digit — and upserts all records into `ruc_padron`. Automatically enqueues `ValidarRucEmpresasJob` 2 minutes after a complete import.
+
+```php
+// app/Jobs/ImportarPadronDnitJob.php
+class ImportarPadronDnitJob implements ShouldQueue
+{
+    use Queueable;
+
+    public int $timeout = 1800;  // ZIPs are large; parsing is line-by-line
+    public int $tries   = 2;
+
+    public function __construct(
+        private readonly ?int $segmento = null,
+    ) {}
+}
+```
+
+<ParamField body="segmento" type="int|null">
+  When `null`, all ten segments are imported. Pass a segment number (0–9) to import a single ZIP — useful for manual re-runs after a segment failure. A failure in one segment does not abort the others.
+</ParamField>
+
+**Key implementation notes:**
+
+- Files are written to `storage/app/dnit/` — this path is **not** the shared `cv_storage` volume. It's created and consumed within the same job execution.
+- ZIP entries are extracted using `basename()` to prevent zip-slip path traversal.
+- Latin-1 files are detected and converted to UTF-8 before parsing (the DNIT has shipped both encodings historically).
+- `upsert()` is called in batches of 2,000 rows (configurable via `dnit.batch_size`); duplicates within a batch are deduplicated by `ruc_completo` before the database call to avoid PostgreSQL's "cannot affect row a second time" error.
+
+---
+
+### ValidarRucEmpresasJob
+
+Scheduled, and also dispatched automatically by `ImportarPadronDnitJob` after a complete import. Batch-validates all `Empresa` RUC numbers against the local `ruc_padron` table and notifies admins if any are cancelled or not found.
+
+```php
+// app/Jobs/ValidarRucEmpresasJob.php
+class ValidarRucEmpresasJob implements ShouldQueue
+{
+    use Queueable;
+
+    public int $timeout = 900;
+    public int $tries   = 2;
+
+    public function handle(RucDnitService $servicio): void
+    {
+        if (RucPadron::estaVacio()) {
+            Log::warning('ValidarRucEmpresasJob: padron vacio, se omite la revalidacion');
+            return;
+        }
+
+        Empresa::query()
+            ->orderBy('id')
+            ->chunkById(200, function ($empresas) use ($servicio, &$resumen): void {
+                foreach ($empresas as $empresa) {
+                    $salida = $servicio->validarEmpresa($empresa);
+                    // ...
+                }
+            });
+    }
+}
+```
+
+Only notifies admins when there are companies with `valido_cancelado` or `no_encontrado` results — a monthly "zero irregular companies" email trains admins to ignore alerts.
+
+---
+
+### ValidarLicenciaSiamJob
+
+Dispatched when an `LicenciaEmpresa` is submitted. Queries the MADES SIAM public registry to verify that the environmental licence's `expediente_siam` number exists and matches the company's RUC.
+
+```php
+// app/Jobs/ValidarLicenciaSiamJob.php
+class ValidarLicenciaSiamJob implements ShouldQueue
+{
+    use Queueable;
+
+    public int $tries   = 3;
+    public int $timeout = 60;
+
+    /** Staggered backoff: 1 min, 5 min, 15 min */
+    public array $backoff = [60, 300, 900];
+
+    public function __construct(private LicenciaEmpresa $licencia) {}
+}
+```
+
+<Accordion title="Backoff strategy and result states">
+MADES portal outages last minutes or hours, not seconds — burst retries waste queue capacity. The three attempts use `[60, 300, 900]` second gaps.
+
+After all retries, `siam_resultado` is set to `servicio_no_disponible`, which is a legitimate state distinct from a negative verification.
+
+| Result | Notifies | Description |
+|---|---|---|
+| `coincide` | No | Normal case — no action needed |
+| `ruc_no_coincide` | Yes (on change) | Licence expediente found but RUC doesn't match |
+| `expediente_no_encontrado` | Yes (on change) | Expediente not in SIAM |
+| `servicio_no_disponible` | No | Portal down — retried |
+| `sin_expediente` | No | Skipped at entry (no expediente to query) |
+
+Notifications fire only when the result **changes** to a negative one — a persistently wrong expediente number generates exactly one alert, not one per weekly scheduled run.
+</Accordion>
+
+---
+
+### ProcesarOcrLicenciaJob
+
+Dispatched after SIAM download. Reads the licence PDF and persists extracted text and metadata (RF10).
+
+```php
+// app/Jobs/ProcesarOcrLicenciaJob.php
+class ProcesarOcrLicenciaJob implements ShouldQueue
+{
+    use Queueable;
+
+    public const POR_LA_EMPRESA        = 'empresa';
+    public const POR_LA_ADMINISTRACION = 'administracion';
+    public const POR_EL_SISTEMA        = 'sistema';
+
+    public int $tries   = 2;
+    public int $timeout = 180;  // Dompdf rasterizes at 300 dpi per page
+
+    public function __construct(
+        private LicenciaEmpresa $licencia,
+        private string $solicitadaPor = self::POR_EL_SISTEMA,
+    ) {}
+}
+```
+
+<Steps>
+  <Step title="Cheap path: native text layer">
+    `PdfTextoExtractor::esEscaneado()` checks whether the PDF has a usable text layer. If it does, text is extracted without OCR.
+  </Step>
+  <Step title="OCR path: scanned documents">
+    19 of the 26 SIAM expedients are JPEG scans with only a "Archivo MADES" watermark as text. `ReconocimientoOptico` runs Tesseract locally — the document never leaves the server.
+  </Step>
+  <Step title="Persist with priority">
+    `persistir()` only fills **blank** fields from OCR suggestions; values the company already entered manually take priority. Confidence score and diagnosis are always written, even when no field could be completed.
+  </Step>
+</Steps>
+
+<Tip>
+  The `$solicitadaPor` constant distinguishes two different workflows. When `empresa` reads the licence, it pre-fills the form. When `administracion` reads it, it's a verification task. Without this distinction, a company-triggered read would appear as "already verified at 100%" to the admin before they had done any verification.
+</Tip>
+
+---
+
+## Privacy & Compliance Jobs
+
+### ProcesarSolicitudPrivacidadJob
+
+Dispatched when an ARCO (access, rectification, cancellation, opposition) request is submitted under Ley N.° 7.593/2025.
+
+```php
+// app/Jobs/ProcesarSolicitudPrivacidadJob.php
+class ProcesarSolicitudPrivacidadJob implements ShouldQueue
+{
+    use Queueable;
+
+    public function __construct(
+        protected int $solicitudId
+    ) {}
+
+    public function handle(ExportarDatosPersonalesService $exportService): void
+    {
+        // ...
+        [$estado, $respuesta] = match ($solicitud->tipo) {
+            'acceso', 'portabilidad' => ['resuelta', '...'],
+            'rectificacion'          => ['en_proceso', '...'],
+            'supresion'              => ['en_proceso', '...'],
+            'oposicion'              => ['en_proceso', '...'],
+            default                  => ['en_proceso', '...'],
+        };
+
+        $path = match ($solicitud->tipo) {
+            'acceso'       => $exportService->exportarPdf($solicitud->user),
+            'portabilidad' => $exportService->exportarJson($solicitud->user),
+            default        => null,
+        };
+        // ...
+    }
+}
+```
+
+<Accordion title="Why five types have two different outcomes">
+| Type | Automated | Reason |
+|---|---|---|
+| `acceso` | ✅ PDF export, closes to `resuelta` | Read-only — data is already there |
+| `portabilidad` | ✅ JSON export, closes to `resuelta` | Read-only — data is already there |
+| `rectificacion` | ❌ Moves to `en_proceso` | Requires knowing **what** to correct |
+| `supresion` | ❌ Moves to `en_proceso` | Contracts and constancias must be retained by environmental law |
+| `oposicion` | ❌ Moves to `en_proceso` | Requires weighing interests of both parties |
+
+The 30-day legal deadline continues running for `en_proceso` requests. Admin panels must be monitored.
+</Accordion>
+
+---
+
+## Metrics & Scheduler Jobs
+
+### ActualizarMetricasOdsJob
+
+Scheduled (typically monthly). Updates the `MetricaOds` record for a given year/month with all SDG indicators.
+
+```php
+// app/Jobs/ActualizarMetricasOdsJob.php
+class ActualizarMetricasOdsJob implements ShouldQueue
+{
+    use Queueable;
+
+    public int $tries   = 3;
+    public int $timeout = 120;
+
+    public function __construct(
+        private readonly int $anio,
+        private readonly int $mes,
+    ) {}
+}
+```
+
+<ParamField body="anio" type="int" required>
+  Four-digit year for the metrics period.
+</ParamField>
+
+<ParamField body="mes" type="int" required>
+  Month number (1–12) for the metrics period.
+</ParamField>
+
+Computes and persists:
+
+| Field | Source |
+|---|---|
+| `indice_trazabilidad` | `TrazabilidadService::indiceGlobal()` |
+| `contratos_completados` | `Contrato::completados()` in period |
+| `toneladas_revalorizadas` | Sum of `cantidad_retirada` on confirmed constancias |
+| `kg_co2_evitados` / `kg_co2_acumulado` | Sum of `kg_co2_evitados` on confirmed constancias |
+| `indice_circularidad_promedio` | `AVG(TipoValorizacion::sqlNivel())` on adjudicated lots |
+| `constancias_emitidas` / `constancias_confirmadas` | Count by state in period |
+
+<Warning>
+  The circularidad SQL CASE expression is generated by `TipoValorizacion::sqlNivel()` and **not** written inline in this job. An inconsistency between the SQL here and the enum would silently shift the thesis-reported index without triggering any interface test.
+</Warning>
+
+Also updates all active `ObjetivoAmbiental` records for the period by calling `$objetivo->actualizarLogrado()`.
+
+---
+
+### EjecutarComandoJob
+
+Dispatched by the Admin panel's `ComandosPage`. Runs an Artisan command asynchronously and records the output in the `command_runs` table.
+
+```php
+// app/Jobs/EjecutarComandoJob.php
+class EjecutarComandoJob implements ShouldQueue
+{
+    use Queueable;
+
+    public int $tries   = 1;   // Many commands delete data — no automatic retry
+    public int $timeout = 7200;
+
+    public function __construct(
+        private readonly string $comando,
+        private readonly ?int $usuarioId = null,
+        private readonly ?string $variante = null,
+    ) {}
+}
+```
+
+<Warning>
+  `$tries = 1` is intentional. Commands like `dnit:importar-padron` can delete and re-insert millions of rows. An automatic retry on a mid-run failure would cause more damage than the original failure.
+</Warning>
+
+<Accordion title="Security: command allow-list">
+  Both the panel UI and the job itself resolve allowed commands through `ComandosOperativos::argumentosDe($comando, $variante)`. If the resolved value is `null`, the job logs a warning and returns without executing. This prevents a manipulated job payload from running arbitrary Artisan commands even if an attacker can write to the queue.
+</Accordion>
+
+Captured output is truncated to the last **8,000 characters** before storage — the DNIT import emits thousands of lines and the column is for diagnostics, not archiving a full run.
+
+---
+
+## Infrastructure Requirements
+
+<CardGroup cols={2}>
+  <Card title="Queue Worker" icon="server">
+    The `queue` container must be running for any async job to process. Start with `docker compose up -d queue`. It shares the `app_state`, `cv_storage`, and `private_storage` volumes with `web` so jobs can write files that the web container can read.
+  </Card>
+  <Card title="Scheduler" icon="clock">
+    The `scheduler` container must be running for periodic jobs (`ImportarPadronDnitJob`, `ActualizarMetricasOdsJob`, etc.). It runs `schedule:work` and depends on `web` being healthy. Check with `docker compose logs scheduler`.
+  </Card>
+</CardGroup>

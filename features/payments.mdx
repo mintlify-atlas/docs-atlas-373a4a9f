@@ -1,0 +1,217 @@
+---
+title: "Payment Processing: Pagopar, DLocalGo, and Simulated Gateway"
+sidebarTitle: "Payments"
+description: "How ExcedentMarket processes contract payments via Pagopar, DLocalGo, and a simulated fallback gateway, including webhooks and session configuration."
+---
+
+Payment processing in ExcedentMarket is abstracted behind a gateway interface so that Paraguay-native processors (Pagopar), international providers (DLocalGo), and a demo-mode simulator can coexist under the same checkout flow. The `PaymentGatewayManager` orchestrates gateway selection, checkout initiation, webhook dispatching, and payment confirmation — all without the controller needing to know which processor is active.
+
+## Gateway Abstraction — `PaymentGateway` Interface
+
+Every gateway implements the same contract:
+
+```php
+// app/Contracts/PaymentGateway.php
+interface PaymentGateway
+{
+    public function nombre(): string;      // 'pagopar' | 'dlocalgo' | 'simulado'
+    public function etiqueta(): string;    // Human-readable label
+    public function disponible(): bool;    // Whether credentials are configured
+
+    /** Initiates a transaction and returns the checkout redirect URL */
+    public function iniciar(Contrato $contrato, User $comprador): array;
+
+    /** Returns the checkout URL for an existing payment_id */
+    public function urlCheckout(string $paymentId): string;
+
+    /** Processes an inbound webhook payload */
+    public function procesarWebhook(array $payload, string $firma): array;
+
+    /** Confirms or cancels a simulated payment */
+    public function confirmarSimulado(string $paymentId, bool $pagado, string $formaPago): Pago;
+
+    /** Queries current payment status */
+    public function consultarEstado(string $paymentId): array;
+}
+```
+
+<CardGroup cols={3}>
+  <Card title="Pagopar" icon="credit-card">
+    Paraguay-native payment processor. Supports local bank transfers, credit cards, and cash payments at authorised agents. Identified by `pagopar_hash` in the `pagos` table.
+  </Card>
+  <Card title="DLocalGo" icon="globe">
+    Default international gateway. Supports card payments. Payment tracked via `dlocalgo_payment_id`. Status values: `PAID`, `PENDING`, `CANCELLED`, `REJECTED`, `EXPIRED`.
+  </Card>
+  <Card title="Simulado" icon="flask">
+    Demo fallback used when neither Pagopar nor DLocalGo credentials are configured. Accepts an explicit confirm/cancel call from the admin panel — no real money moves.
+  </Card>
+</CardGroup>
+
+## Gateway Manager — `PaymentGatewayManager`
+
+The manager is resolved from the service container and injected into `PaymentController`. It reads registered gateways from the container (bound in `AppServiceProvider`) and falls back to the simulator when no real gateway is available:
+
+```php
+// app/Services/PaymentGatewayManager.php
+public function porDefecto(): ?PaymentGateway
+{
+    // Priority: first available real gateway > simulado
+    foreach ($this->disponibles() as $gateway) {
+        if ($gateway->nombre() !== 'simulado') {
+            return $gateway;
+        }
+    }
+
+    return $this->get('simulado');
+}
+```
+
+Gateway availability is checked at runtime via `disponible()`, which verifies that the required credentials exist in `config/services.php`. A gateway whose credentials are missing is excluded from `disponibles()` and never offered to users.
+
+## Checkout Flow
+
+<Steps>
+  <Step title="Buyer navigates to checkout">
+    From the contract detail page, the buyer selects a payment gateway and is directed to:
+    ```
+    GET /portal/contratos/{contrato}/pagar?pasarela=pagopar|dlocalgo|simulado
+    ```
+  </Step>
+  <Step title="PaymentController::iniciar() validates and delegates">
+    ```php
+    // app/Http/Controllers/PaymentController.php
+    public function iniciar(Request $request, int $contratoId): RedirectResponse
+    {
+        $request->validate([
+            'pasarela' => 'required|string|in:pagopar,dlocalgo,simulado',
+        ]);
+
+        $gateway = $this->gateways->get($nombrePasarela);
+
+        if (!$gateway || !$gateway->disponible()) {
+            return back()->withErrors(['pago' => 'Pasarela de pago no disponible']);
+        }
+        // ...
+        $resultado = $gateway->iniciar($contrato, auth()->user());
+        return redirect()->away($resultado['redirect_url']);
+    }
+    ```
+    The controller verifies that the contract belongs to the authenticated buyer and is in `pendiente_pago` state before delegating to the gateway.
+  </Step>
+  <Step title="Reuse existing pending payment">
+    If a `pendiente` payment with a non-expired `payment_id` already exists for this contract and gateway, the buyer is redirected to the existing checkout URL instead of creating a new transaction. Expired payments (older than the gateway's validity window) are marked `fallido` and a new one is created.
+  </Step>
+  <Step title="Buyer completes payment on gateway">
+    The buyer is redirected away to Pagopar's or DLocalGo's hosted checkout page.
+  </Step>
+  <Step title="Gateway posts webhook">
+    The gateway calls `POST /api/pago/webhook` with the result. The system confirms the payment and transitions the contract to `activo`.
+  </Step>
+</Steps>
+
+## Webhook Endpoint
+
+```http
+POST /api/pago/webhook
+```
+
+```php
+// routes/web.php
+Route::post('/api/pago/webhook', [PaymentController::class, 'webhook'])
+    ->middleware('throttle:webhook')
+    ->name('pago.webhook');
+```
+
+The webhook handler is **unauthenticated** but rate-limited. It auto-detects the originating gateway by looking up the `payment_id` or `hash_pedido` in the `pagos` table:
+
+```php
+// app/Http/Controllers/PaymentController.php
+public function webhook(Request $request): JsonResponse
+{
+    $paymentId = $payload['payment_id'] ?? $payload['hash_pedido'] ?? null;
+
+    $gateway = $this->gateways->detectarPorPaymentId($paymentId);
+    // ...
+    $gateway->procesarWebhook($payload, $firma);
+    return response()->json(['status' => 'ok'], 200);
+}
+```
+
+The signature is read from `X-Signature` (DLocalGo) or `V2-HMAC-SHA256` (Pagopar) headers. Each gateway's `procesarWebhook()` implementation verifies the signature before processing.
+
+<Warning>
+  Pagopar retries webhooks. `DocumentoService::emitirDocumentosDelCobro()` is idempotent — it checks per document type before emitting, so duplicate webhook deliveries do not produce duplicate receipts.
+</Warning>
+
+## Payment States
+
+The `EstadoPago` enum covers the full payment lifecycle:
+
+```php
+// app/Enums/EstadoPago.php
+enum EstadoPago: string
+{
+    case Pendiente   = 'pendiente';   // Checkout initiated, awaiting confirmation
+    case Pagado      = 'pagado';      // Gateway confirmed successful payment
+    case Fallido     = 'fallido';     // Payment attempt failed or expired
+    case Reembolsado = 'reembolsado'; // Previously confirmed, now reversed
+}
+```
+
+<Note>
+  `reembolsado` is distinct from `fallido`. A failed payment never completed; a reimbursed payment was confirmed and later reversed by the gateway. `PagoparService` handles both transitions when processing webhooks.
+</Note>
+
+## On Payment Confirmation
+
+When a payment transitions to `pagado`, the following happens in sequence:
+
+1. **Contract state** → updated to `activo`
+2. **`PagoConfirmadoNotification`** → sent to the buyer and generator
+3. **`DocumentoService::emitirDocumentosDelCobro()`** → generates the Material Receipt (`RM-...`) and Payment Confirmation (`CP-...`) PDFs
+4. **`InventarioService`** → registers the stock egress from the generator's warehouse and ingress to the recycler's warehouse (triggered by the `activo` state transition observer)
+
+## Simulated Gateway
+
+The `Simulado` gateway enables end-to-end testing and live demos without real payment credentials. An admin can confirm or cancel a pending simulated payment via the Filament admin panel, which calls:
+
+```php
+// app/Contracts/PaymentGateway.php (implemented by SimuladoService)
+public function confirmarSimulado(string $paymentId, bool $pagado, string $formaPago): Pago
+```
+
+This method sets `estado = 'pagado'` (or `'fallido'`) and `fecha_pago`, then fires the same downstream events as a real webhook so that the full document and inventory pipeline runs in demo mode.
+
+## SESSION_SAME_SITE=lax Requirement
+
+The checkout flow performs a cross-site redirect: the browser leaves ExcedentMarket's domain, completes payment on Pagopar's or DLocalGo's domain, and is redirected back. Laravel's session cookie must survive this round trip.
+
+```ini
+# .env
+SESSION_SAME_SITE=lax
+```
+
+With `SameSite=Strict`, the session cookie is not sent on the redirect back from the payment gateway's domain, and the user arrives at the result page as an unauthenticated guest. `SameSite=Lax` allows the cookie on top-level cross-site navigations (redirects), which is exactly what the gateway return URL performs.
+
+<Info>
+  In development, all outgoing email (payment confirmations, offer notifications) is captured by **Mailpit** and is never delivered to real addresses. Access the Mailpit UI at `http://localhost:8025` after starting the Docker Compose stack.
+</Info>
+
+## Pago Model
+
+The `Pago` model stores gateway-specific identifiers for both Pagopar and DLocalGo in separate columns, making it straightforward to retrieve gateway-specific fields without string manipulation:
+
+```php
+// app/Models/Pago.php
+protected $fillable = [
+    'contrato_id', 'monto', 'estado', 'pasarela',
+    // Pagopar columns
+    'pagopar_hash', 'pagopar_numero_pedido',
+    'pagopar_forma_pago', 'pagopar_forma_pago_id', 'pagopar_comprobante',
+    // DLocalGo columns
+    'dlocalgo_payment_id', 'dlocalgo_order_id',
+    'dlocalgo_forma_pago', 'dlocalgo_forma_pago_id', 'dlocalgo_comprobante',
+];
+```
+
+The `pasarela` column identifies which set of columns is populated for a given payment record and is used by `PaymentGatewayManager::detectarPorPaymentId()` to route incoming webhooks to the correct gateway instance.

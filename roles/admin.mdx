@@ -1,0 +1,231 @@
+---
+title: "Admin Panel: Platform Oversight and Compliance Tools"
+sidebarTitle: "Admin"
+description: "The Admin panel provides full platform oversight: company management, environmental compliance, traceability monitoring, privacy requests, and system operations tools."
+---
+
+The **Admin** panel is ExcedentMarket's command center for platform-level oversight. Administrators do not participate in day-to-day trading — they don't publish lots or submit offers. Instead, the Admin panel focuses on ensuring that every company operating on the platform holds the environmental authorizations required by **Ley N.° 294/93**, that the waste transfer chain meets the traceability standards expected of a circular economy marketplace, and that privacy obligations under **Ley N.° 7.593** are fulfilled. The panel is accessible at `/admin`; the direct login URL is `/admin/login`.
+
+<Warning>
+  The Admin account is created exclusively by the database seeder. There is no public registration path for admins. **Development credentials** (for local environments only): `admin@excedentmarket.com` / `admin1234`. Rotate these immediately before any non-local deployment.
+</Warning>
+
+## Dashboard widgets
+
+The Admin dashboard title is "Panel de Control". Its nine widgets are defined in `Dashboard::getWidgets()` in a deliberate order — commercial KPIs first, environmental impact second, compliance alerts last:
+
+```php
+// web/app/Filament/Admin/Pages/Dashboard.php
+public function getWidgets(): array
+{
+    return [
+        Widgets\ComisionesWidget::class,
+        Widgets\StatsOverviewWidget::class,
+        Widgets\ImpactoAmbientalWidget::class,
+        Widgets\TrazabilidadWidget::class,
+        Widgets\EvolucionMensualChart::class,
+        Widgets\LotesPorEstadoChart::class,
+        Widgets\TopMaterialesChart::class,
+        Widgets\SolicitudesPrivacidadPendientesWidget::class,
+        Widgets\LicenciasProximasVencerWidget::class,
+    ];
+}
+```
+
+### Commercial KPIs — `ComisionesWidget`
+
+The top widget surfaces the three numbers that define the platform's business model: realized commissions, total volume transacted, and commissions in progress. It distinguishes contracts that have already paid (`activo` or `completado`) from those still awaiting payment (`pendiente_pago`):
+
+```php
+// web/app/Filament/Admin/Widgets/ComisionesWidget.php
+private const ESTADOS_REALIZADOS = ['activo', 'completado'];
+
+protected function getStats(): array
+{
+    $comisionesRealizadas = (float) Contrato::whereIn('estado', self::ESTADOS_REALIZADOS)
+        ->sum('comision_plataforma');
+    $volumenTransado = (float) Contrato::whereIn('estado', self::ESTADOS_REALIZADOS)
+        ->sum('monto_material');
+    $comisionesEnTramite = (float) Contrato::where('estado', 'pendiente_pago')
+        ->sum('comision_plataforma');
+
+    return [
+        Stat::make('Comisiones recaudadas', Guaranies::formato($comisionesRealizadas))
+            ->description($transacciones . ' contratos pagados')->color('success'),
+        Stat::make('Volumen transado', Guaranies::formato($volumenTransado))
+            ->description('Valor del material comercializado')->color('info'),
+        Stat::make('Comisiones en trámite', Guaranies::formato($comisionesEnTramite))
+            ->description('Contratos pendientes de pago')->color('warning'),
+    ];
+}
+```
+
+### Operational overview — `StatsOverviewWidget`
+
+Seven linked stats cover the entire operational pipeline. Each stat is a clickable deep link that opens the matching resource list with the relevant filter pre-applied:
+
+<Accordion title="StatsOverviewWidget stats">
+  | Stat | Filter applied |
+  |---|---|
+  | Empresas activas | `estado = activo` |
+  | Lotes publicados | `estado = publicado` |
+  | Lotes adjudicados | `estado = adjudicado` |
+  | Contratos activos | `estado = [activo]` |
+  | Contratos completados | `estado = [completado]` |
+  | Ofertas pendientes | `estado = pendiente` |
+  | Licencias pendientes | `estado_validacion = [pendiente]`, grouped by `empresa.nombre` |
+</Accordion>
+
+### Environmental impact — `ImpactoAmbientalWidget`
+
+Reports CO₂ avoided (ODS 13) and waste valorized (ODS 12) from confirmed waste transfer certificates (`ConstanciaTransmision`). Also surfaces the count of approved licenses approaching their next audit date:
+
+```php
+// web/app/Filament/Admin/Widgets/ImpactoAmbientalWidget.php
+Stat::make('CO2 evitado (historico)',
+    Unidades::toneladasFormateadas($kgCo2Total) . ' CO2'
+)->description('ODS 13 — Accion por el clima')->color('success'),
+
+Stat::make('Residuos revalorizados (total)',
+    Unidades::toneladasFormateadas($kgRevalorizados)
+)->description('ODS 12 — Consumo responsable')->color('info'),
+```
+
+### Traceability index — `TrazabilidadWidget`
+
+Surfaces the platform's supply-chain traceability score: what proportion of evaluated lots completed all chain links, the average completeness per lot, and — critically — which link breaks the chain most often:
+
+```php
+// web/app/Filament/Admin/Widgets/TrazabilidadWidget.php
+Stat::make('Indice de trazabilidad', Numeros::porcentaje($resumen['proporcion']))
+    ->description(sprintf(
+        '%d de %d lotes con los %d eslabones completos',
+        $resumen['completos'],
+        $resumen['lotes_evaluados'],
+        TrazabilidadService::TOTAL_ESLABONES,
+    )),
+
+Stat::make('La cadena se corta en',
+    $numero . ' · ' . $resumen['eslabones'][$numero]
+)->color('warning'),
+```
+
+### Compliance alerts
+
+The two lowest-priority widgets act as a compliance to-do list:
+
+| Widget | What it shows |
+|---|---|
+| `SolicitudesPrivacidadPendientesWidget` | Data subject requests (access, rectification, deletion) under Ley N.° 7.593 that need admin action. |
+| `LicenciasProximasVencerWidget` | Up to 5 approved environmental licenses whose next audit date falls within their per-license alert window (defaulting to 60 days). Linked to the companies that hold them. |
+
+## Resources
+
+The Admin panel organizes resources into three navigation groups:
+
+### Administración group
+
+<CardGroup cols={2}>
+  <Card title="EmpresaResource" icon="building-office">
+    Full CRUD for companies. Validates RUC against the DNIT/SET padrón via `RucDnitService`. Includes relation managers for licenses and published lots. The central entity that connects users to trading activity.
+  </Card>
+  <Card title="MaterialResource" icon="beaker">
+    Master catalogue of tradeable materials, including CO₂ emission factors per kg used by environmental calculations across the platform. Supports create, edit, and list operations.
+  </Card>
+  <Card title="ObjetivoAmbientalResource" icon="globe-alt">
+    Platform-level environmental objectives (ODS targets), used to evaluate whether the marketplace's cumulative impact is on track.
+  </Card>
+  <Card title="RucPadronResource" icon="identification">
+    Read-only mirror of the DNIT RUC padrón used for company verification. Supports search by RUC during company registration or validation.
+  </Card>
+</CardGroup>
+
+### Operación group
+
+<CardGroup cols={2}>
+  <Card title="LotePublicadoResource" icon="cube-transparent">
+    **Read-only** supervision of all lots across all companies. Admin can view lot details and open the public marketplace page, but cannot create or edit lots. Grouped by state to surface active negotiations first.
+  </Card>
+  <Card title="ContratoResource" icon="document-text">
+    View and supervise all contracts. Includes the `ConstanciaTransmision` relation manager for waste transfer certificates. Read-only from the admin perspective — contract creation is triggered by the offer acceptance flow.
+  </Card>
+  <Card title="OfertaResource" icon="currency-dollar">
+    Platform-wide offer listing with filters by state, company, and lot. Used to investigate disputed offers or investigate pricing patterns.
+  </Card>
+  <Card title="LicenciaEmpresaResource" icon="identification">
+    Validate, approve, or reject company environmental licenses (Ley N.° 294/93). Pending licenses are surfaced in `StatsOverviewWidget` and in `LicenciasProximasVencerWidget`. This resource gates a company's ability to publish lots or submit offers.
+  </Card>
+  <Card title="DocumentoCertificacionResource" icon="document-check">
+    Platform-wide view of all compliance documents attached to companies and lots.
+  </Card>
+  <Card title="IncidenteSeguridadResource" icon="shield-exclamation">
+    Security incident log. Incidents are opened automatically by `DeteccionIncidentes` when brute-force thresholds are exceeded. Admins can create manual incidents, edit investigation notes, and track resolution.
+  </Card>
+</CardGroup>
+
+### Privacidad / Auditoría group
+
+<CardGroup cols={2}>
+  <Card title="SolicitudPrivacidadResource" icon="lock-closed">
+    Manages data subject requests under **Ley N.° 7.593**. Admin reviews each request, generates a signed download link (`/privacidad/descargar/{solicitud}`), and marks it resolved.
+  </Card>
+  <Card title="PoliticaPrivacidadResource" icon="document">
+    Manage privacy policy versions. Publishing a new version increments the active version number and triggers re-consent for all users on their next login.
+  </Card>
+  <Card title="AuditLogResource" icon="magnifying-glass">
+    Immutable audit trail of all model changes captured by the audit package. Read-only list — no create, edit, or delete actions.
+  </Card>
+</CardGroup>
+
+## Special system pages
+
+Beyond resources, the Admin panel includes three system operations pages under the **Sistema** navigation group:
+
+### ComandosPage — run Artisan commands from the UI
+
+`ComandosPage` exposes a curated list of operationally necessary Artisan commands that an admin can dispatch without SSH access. Commands are enqueued via `EjecutarComandoJob` and never run synchronously in the HTTP request. Each command shows its last run time, exit status, and next scheduled execution:
+
+```php
+// web/app/Filament/Admin/Pages/ComandosPage.php
+public function ejecutar(string $comando, ?string $variante = null): void
+{
+    // Key is resolved against the allow-list; raw text never reaches Artisan.
+    if (ComandosOperativos::argumentosDe($comando, $variante) === null) {
+        Notification::make()->danger()->title('Comando no permitido')->send();
+        return;
+    }
+
+    EjecutarComandoJob::dispatch($comando, auth()->id(), $variante);
+
+    Notification::make()
+        ->success()
+        ->title('Comando encolado')
+        ->body('Se ejecutara en segundo plano.')
+        ->send();
+}
+```
+
+<Tip>
+  Destructive commands (those marked `destructivo: true` in `ComandosOperativos::COMANDOS`) render a red confirmation modal that shows the exact `php artisan` line that will be dispatched. Non-destructive commands show a blue modal. Never judge a command's risk by button colour alone — always read the command details in the modal.
+</Tip>
+
+### QueueMonitorPage
+
+Provides a live view of the Laravel queue: pending jobs, failed jobs, and worker status. Useful for verifying that `EjecutarComandoJob` dispatches have been picked up and completed successfully.
+
+### SystemLogsPage
+
+Displays recent application log entries directly in the browser, eliminating the need to tail log files over SSH for routine diagnostics.
+
+## Seeding the Admin account
+
+The Admin user is created by `db:seed`. The `shield:generate` command must run first so that the `admin` role already exists in the `roles` table when the seeder tries to assign it:
+
+```bash
+php artisan shield:generate --all
+php artisan db:seed
+```
+
+<Info>
+  After seeding, the Admin account email is `admin@excedentmarket.com` and the password is `admin1234`. **These are development-only credentials.** Change both before deploying to any environment accessible from outside your local machine.
+</Info>
